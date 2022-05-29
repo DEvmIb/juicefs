@@ -14,21 +14,22 @@
  * limitations under the License.
  */
 
-package main
+package cmd
 
 import (
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/erikdubbelboer/gspt"
 	"github.com/google/gops/agent"
-	"github.com/sirupsen/logrus"
-
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
+	"github.com/pyroscope-io/client/pyroscope"
+	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
 )
 
@@ -37,7 +38,7 @@ var logger = utils.GetLogger("juicefs")
 func Main(args []string) error {
 	cli.VersionFlag = &cli.BoolFlag{
 		Name: "version", Aliases: []string{"V"},
-		Usage: "print only the version",
+		Usage: "print version only",
 	}
 	app := &cli.App{
 		Name:                 "juicefs",
@@ -64,6 +65,8 @@ func Main(args []string) error {
 			cmdGateway(),
 			cmdWebDav(),
 			cmdBench(),
+			cmdObjbench(),
+			cmdMdtest(),
 			cmdWarmup(),
 			cmdRmr(),
 			cmdSync(),
@@ -76,14 +79,6 @@ func Main(args []string) error {
 	}
 
 	return app.Run(reorderOptions(app, args))
-
-}
-
-func main() {
-	err := Main(os.Args)
-	if err != nil {
-		logger.Fatal(err)
-	}
 }
 
 func handleSysMountArgs(args []string) []string {
@@ -225,7 +220,7 @@ func reorderOptions(app *cli.App, args []string) []string {
 // Check number of positional arguments, set logger level and setup agent if needed
 func setup(c *cli.Context, n int) {
 	if c.NArg() < n {
-		logger.Errorf("This command requires at least %d arguments", n)
+		fmt.Printf("ERROR: This command requires at least %d arguments\n", n)
 		fmt.Printf("USAGE:\n   juicefs %s [command options] %s\n", c.Command.Name, c.Command.ArgsUsage)
 		os.Exit(1)
 	}
@@ -254,6 +249,30 @@ func setup(c *cli.Context, n int) {
 				_ = agent.Listen(agent.Options{Addr: fmt.Sprintf("127.0.0.1:%d", port)})
 			}
 		}()
+	}
+
+	if c.IsSet("pyroscope") {
+		tags := make(map[string]string)
+		appName := fmt.Sprintf("juicefs.%s", c.Command.Name)
+		if c.Command.Name == "mount" {
+			tags["mountpoint"] = c.Args().Get(1)
+		}
+		if hostname, err := os.Hostname(); err == nil {
+			tags["hostname"] = hostname
+		}
+		tags["pid"] = strconv.Itoa(os.Getpid())
+		tags["version"] = version.Version()
+
+		if _, err := pyroscope.Start(pyroscope.Config{
+			ApplicationName: appName,
+			ServerAddress:   c.String("pyroscope"),
+			Logger:          logger,
+			Tags:            tags,
+			AuthToken:       os.Getenv("PYROSCOPE_AUTH_TOKEN"),
+			ProfileTypes:    pyroscope.DefaultProfileTypes,
+		}); err != nil {
+			logger.Errorf("start pyroscope agent: %v", err)
+		}
 	}
 }
 

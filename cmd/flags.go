@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package main
+package cmd
 
 import (
 	"os"
@@ -36,7 +36,7 @@ func globalFlags() []cli.Flag {
 		&cli.BoolFlag{
 			Name:    "quiet",
 			Aliases: []string{"q"},
-			Usage:   "only warning and errors",
+			Usage:   "show warning and errors only",
 		},
 		&cli.BoolFlag{
 			Name:  "trace",
@@ -45,6 +45,10 @@ func globalFlags() []cli.Flag {
 		&cli.BoolFlag{
 			Name:  "no-agent",
 			Usage: "disable pprof (:6060) and gops (:6070) agent",
+		},
+		&cli.StringFlag{
+			Name:  "pyroscope",
+			Usage: "pyroscope address",
 		},
 		&cli.BoolFlag{
 			Name:  "no-color",

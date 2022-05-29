@@ -57,7 +57,7 @@ func (m *memStore) Head(key string) (Object, error) {
 	}
 	o, ok := m.objects[key]
 	if !ok {
-		return nil, errors.New("not exists")
+		return nil, os.ErrNotExist
 	}
 	f := &file{
 		obj{
@@ -84,6 +84,9 @@ func (m *memStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	d, ok := m.objects[key]
 	if !ok {
 		return nil, errors.New("not exists")
+	}
+	if off > int64(len(d.data)) {
+		off = int64(len(d.data))
 	}
 	data := d.data[off:]
 	if limit > 0 && limit < int64(len(data)) {

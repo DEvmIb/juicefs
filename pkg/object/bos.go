@@ -22,6 +22,7 @@ package object
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -55,6 +56,9 @@ func (q *bosclient) Create() error {
 func (q *bosclient) Head(key string) (Object, error) {
 	r, err := q.c.GetObjectMeta(q.bucket, key)
 	if err != nil {
+		if e, ok := err.(*bce.BceServiceError); ok && e.StatusCode == http.StatusNotFound {
+			err = os.ErrNotExist
+		}
 		return nil, err
 	}
 	mtime, _ := time.Parse(time.RFC1123, r.LastModified)
@@ -101,7 +105,11 @@ func (q *bosclient) Copy(dst, src string) error {
 }
 
 func (q *bosclient) Delete(key string) error {
-	return q.c.DeleteObject(q.bucket, key)
+	err := q.c.DeleteObject(q.bucket, key)
+	if err != nil && strings.Contains(err.Error(), "NoSuchKey") {
+		err = nil
+	}
+	return err
 }
 
 func (q *bosclient) List(prefix, marker string, limit int64) ([]Object, error) {

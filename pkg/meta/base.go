@@ -28,11 +28,14 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/juicedata/juicefs/pkg/version"
 )
 
 const (
-	inodeBatch   = 100
-	chunkIDBatch = 1000
+	inodeBatch    = 100
+	chunkIDBatch  = 1000
+	minUpdateTime = time.Millisecond * 10
+	nlocks        = 1024
 )
 
 type engine interface {
@@ -64,10 +67,13 @@ type engine interface {
 	doUnlink(ctx Context, parent Ino, name string) syscall.Errno
 	doRmdir(ctx Context, parent Ino, name string) syscall.Errno
 	doReadlink(ctx Context, inode Ino) ([]byte, error)
-	doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*Entry) syscall.Errno
+	doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*Entry, limit int) syscall.Errno
 	doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode *Ino, attr *Attr) syscall.Errno
 	doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno
 	doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno
+	doGetParents(ctx Context, inode Ino) map[Ino]int
+
+	GetSession(sid uint64, detail bool) (*Session, error)
 }
 
 type baseMeta struct {
@@ -76,11 +82,13 @@ type baseMeta struct {
 	fmt  Format
 
 	root         Ino
+	txlocks      [nlocks]sync.Mutex // Pessimistic locks to reduce conflict
 	subTrash     internalNode
 	sid          uint64
 	of           *openfiles
 	removedFiles map[Ino]bool
 	compacting   map[uint64]bool
+	maxDeleting  chan struct{}
 	symlinks     *sync.Map
 	msgCallbacks *msgCallbacks
 	newSpace     int64
@@ -109,6 +117,7 @@ func newBaseMeta(conf *Config) baseMeta {
 		of:           newOpenFiles(conf.OpenCache),
 		removedFiles: make(map[Ino]bool),
 		compacting:   make(map[uint64]bool),
+		maxDeleting:  make(chan struct{}, 100),
 		symlinks:     &sync.Map{},
 		msgCallbacks: &msgCallbacks{
 			callbacks: make(map[uint32]MsgCallback),
@@ -125,6 +134,14 @@ func (m *baseMeta) checkRoot(inode Ino) Ino {
 	default:
 		return inode
 	}
+}
+
+func (r *baseMeta) txLock(idx int) {
+	r.txlocks[idx%nlocks].Lock()
+}
+
+func (r *baseMeta) txUnlock(idx int) {
+	r.txlocks[idx%nlocks].Unlock()
 }
 
 func (r *baseMeta) OnMsg(mtype uint32, cb MsgCallback) {
@@ -165,6 +182,7 @@ func (m *baseMeta) Load(checkVersion bool) (*Format, error) {
 func (m *baseMeta) NewSession() error {
 	go m.refreshUsage()
 	if m.conf.ReadOnly {
+		logger.Infof("Create read-only session OK with version: %s", version.Version())
 		return nil
 	}
 
@@ -182,7 +200,7 @@ func (m *baseMeta) NewSession() error {
 	if err = m.en.doNewSession(data); err != nil {
 		return fmt.Errorf("create session: %s", err)
 	}
-	logger.Infof("create session %d OK", m.sid)
+	logger.Infof("Create session %d OK with version: %s", m.sid, version.Version())
 
 	go m.refreshSession()
 	if !m.conf.NoBGJob {
@@ -228,7 +246,12 @@ func (m *baseMeta) CleanStaleSessions() {
 		return
 	}
 	for _, sid := range sids {
-		logger.Infof("clean up stale session %d: %s", sid, m.en.doCleanStaleSession(sid))
+		s, err := m.en.GetSession(sid, false)
+		if err != nil {
+			logger.Warnf("Get session info %d: %s", sid, err)
+			s = &Session{Sid: sid}
+		}
+		logger.Infof("clean up stale session %d %+v: %s", sid, s.SessionInfo, m.en.doCleanStaleSession(sid))
 	}
 }
 
@@ -377,7 +400,7 @@ func (m *baseMeta) StatFS(ctx Context, totalspace, availspace, iused, iavail *ui
 
 func (m *baseMeta) resolveCase(ctx Context, parent Ino, name string) *Entry {
 	var entries []*Entry
-	_ = m.en.doReaddir(ctx, parent, 0, &entries)
+	_ = m.en.doReaddir(ctx, parent, 0, &entries, -1)
 	for _, e := range entries {
 		n := string(e.Name)
 		if strings.EqualFold(name, n) {
@@ -779,9 +802,7 @@ func (m *baseMeta) Close(ctx Context, inode Ino) syscall.Errno {
 		defer m.Unlock()
 		if m.removedFiles[inode] {
 			delete(m.removedFiles, inode)
-			go func() {
-				_ = m.en.doDeleteSustainedInode(m.sid, inode)
-			}()
+			_ = m.en.doDeleteSustainedInode(m.sid, inode)
 		}
 	}
 	return 0
@@ -809,7 +830,7 @@ func (m *baseMeta) Readdir(ctx Context, inode Ino, plus uint8, entries *[]*Entry
 		Name:  []byte(".."),
 		Attr:  &Attr{Typ: TypeDirectory},
 	})
-	return m.en.doReaddir(ctx, inode, plus, entries)
+	return m.en.doReaddir(ctx, inode, plus, entries, -1)
 }
 
 func (m *baseMeta) SetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
@@ -836,18 +857,49 @@ func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 	return m.en.doRemoveXattr(ctx, m.checkRoot(inode), name)
 }
 
+func (m *baseMeta) GetParents(ctx Context, inode Ino) map[Ino]int {
+	if inode == 1 {
+		return map[Ino]int{1: 1}
+	}
+	var attr Attr
+	if st := m.GetAttr(ctx, inode, &attr); st != 0 {
+		logger.Warnf("GetAttr inode %d: %s", inode, st)
+		return nil
+	}
+	if attr.Parent > 0 {
+		return map[Ino]int{attr.Parent: 1}
+	} else {
+		return m.en.doGetParents(ctx, inode)
+	}
+}
+
 func (m *baseMeta) fileDeleted(opened bool, inode Ino, length uint64) {
 	if opened {
 		m.Lock()
 		m.removedFiles[inode] = true
 		m.Unlock()
 	} else {
-		go m.en.doDeleteFileData(inode, length)
+		m.tryDeleteFileData(inode, length)
+	}
+}
+
+func (m *baseMeta) tryDeleteFileData(inode Ino, length uint64) {
+	select {
+	case m.maxDeleting <- struct{}{}:
+		go func() {
+			m.en.doDeleteFileData(inode, length)
+			<-m.maxDeleting
+		}()
+	default:
+		// will be cleanup later
 	}
 }
 
 func (m *baseMeta) deleteSlice(chunkid uint64, size uint32) {
-	if err := m.newMsg(DeleteChunk, chunkid, size); err == nil {
+	if chunkid == 0 {
+		return
+	}
+	if err := m.newMsg(DeleteChunk, chunkid, size); err == nil || strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "not found") {
 		if err = m.en.doDeleteSlice(chunkid, size); err != nil {
 			logger.Errorf("delete slice %d: %s", chunkid, err)
 		}
@@ -892,6 +944,15 @@ func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {
 	return st
 }
 
+func (m *baseMeta) trashEntry(parent, inode Ino, name string) string {
+	s := fmt.Sprintf("%d-%d-%s", parent, inode, name)
+	if len(s) > MaxName {
+		s = s[:MaxName]
+		logger.Warnf("File name is too long as a trash entry, truncating it: %s -> %s", name, s)
+	}
+	return s
+}
+
 func (m *baseMeta) cleanupTrash() {
 	for {
 		utils.SleepWithJitter(time.Hour)
@@ -916,7 +977,7 @@ func (m *baseMeta) doCleanupTrash(force bool) {
 	now := time.Now()
 	var st syscall.Errno
 	var entries []*Entry
-	if st = m.en.doReaddir(ctx, TrashInode, 0, &entries); st != 0 {
+	if st = m.en.doReaddir(ctx, TrashInode, 0, &entries, -1); st != 0 {
 		logger.Warnf("readdir trash %d: %s", TrashInode, st)
 		return
 	}
@@ -929,9 +990,10 @@ func (m *baseMeta) doCleanupTrash(force bool) {
 			logger.Debugf("cleanup trash: nothing to delete")
 		}
 	}()
-
+	batch := 1000000
 	edge := now.Add(-time.Duration(24*m.fmt.TrashDays+1) * time.Hour)
-	for _, e := range entries {
+	for len(entries) > 0 {
+		e := entries[0]
 		ts, err := time.Parse("2006-01-02-15", string(e.Name))
 		if err != nil {
 			logger.Warnf("bad entry as a subTrash: %s", e.Name)
@@ -939,11 +1001,14 @@ func (m *baseMeta) doCleanupTrash(force bool) {
 		}
 		if ts.Before(edge) || force {
 			var subEntries []*Entry
-			if st = m.en.doReaddir(ctx, e.Inode, 0, &subEntries); st != 0 {
+			if st = m.en.doReaddir(ctx, e.Inode, 0, &subEntries, batch); st != 0 {
 				logger.Warnf("readdir subTrash %d: %s", e.Inode, st)
 				continue
 			}
-			rmdir := true
+			rmdir := len(subEntries) < batch
+			if rmdir {
+				entries = entries[1:]
+			}
 			for _, se := range subEntries {
 				if se.Attr.Typ == TypeDirectory {
 					st = m.en.doRmdir(ctx, e.Inode, string(se.Name))

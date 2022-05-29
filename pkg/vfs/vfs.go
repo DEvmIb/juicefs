@@ -35,7 +35,7 @@ type Context = LogContext
 
 const (
 	rootID      = 1
-	maxName     = 255
+	maxName     = meta.MaxName
 	maxSymlink  = 4096
 	maxFileSize = meta.ChunkSize << 31
 )
@@ -70,7 +70,7 @@ var (
 func (v *VFS) Lookup(ctx Context, parent Ino, name string) (entry *meta.Entry, err syscall.Errno) {
 	var inode Ino
 	var attr = &Attr{}
-	if parent == rootID {
+	if parent == rootID || name == ".control" {
 		n := getInternalNodeByName(name)
 		if n != nil {
 			entry = &meta.Entry{Inode: n.inode, Attr: n.attr}
@@ -314,7 +314,7 @@ func (v *VFS) Readdir(ctx Context, ino Ino, size uint32, off int, fh uint64, plu
 		h.children = inodes
 		if ino == rootID && !v.Conf.HideInternal {
 			// add internal nodes
-			for _, node := range internalNodes {
+			for _, node := range internalNodes[1:] {
 				h.children = append(h.children, &meta.Entry{
 					Inode: node.inode,
 					Name:  []byte(node.name),

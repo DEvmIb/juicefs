@@ -43,7 +43,6 @@ type kvTxn interface {
 	get(key []byte) []byte
 	gets(keys ...[]byte) [][]byte
 	scanRange(begin, end []byte) map[string][]byte
-	scan(prefix []byte, handler func(key, value []byte))
 	scanKeys(prefix []byte) [][]byte
 	scanValues(prefix []byte, limit int, filter func(k, v []byte) bool) map[string][]byte
 	exist(prefix []byte) bool
@@ -56,6 +55,7 @@ type kvTxn interface {
 type tkvClient interface {
 	name() string
 	txn(f func(kvTxn) error) error
+	scan(prefix []byte, handler func(key, value []byte)) error
 	reset(prefix []byte) error
 	close() error
 	shouldRetry(err error) bool
@@ -120,7 +120,7 @@ func (m *kvMeta) keyLen(args ...interface{}) int {
 		case string:
 			c += len(a)
 		default:
-			logger.Fatalf("invalid type %T, value %v", a, a)
+			panic(fmt.Sprintf("invalid type %T, value %v", a, a))
 		}
 	}
 	return c
@@ -141,7 +141,7 @@ func (m *kvMeta) fmtKey(args ...interface{}) []byte {
 		case string:
 			b.Put([]byte(a))
 		default:
-			logger.Fatalf("invalid type %T, value %v", a, a)
+			panic(fmt.Sprintf("invalid type %T, value %v", a, a))
 		}
 	}
 	return b.Bytes()
@@ -160,6 +160,7 @@ All keys:
   C...               counter
   AiiiiiiiiI         inode attribute
   AiiiiiiiiD...      dentry
+  AiiiiiiiiPiiiiiiii parents // for hard links
   AiiiiiiiiCnnnn     file chunks
   AiiiiiiiiS         symlink target
   AiiiiiiiiX...      extented attribute
@@ -167,7 +168,7 @@ All keys:
   Fiiiiiiii          Flocks
   Piiiiiiii          POSIX locks
   Kccccccccnnnn      slice refs
-  Lcccccccctttttttt  delayed slices
+  Lttttttttcccccccc  delayed slices
   SEssssssss         session expire time
   SHssssssss         session heartbeat // for legacy client
   SIssssssss         session info
@@ -180,6 +181,10 @@ func (m *kvMeta) inodeKey(inode Ino) []byte {
 
 func (m *kvMeta) entryKey(parent Ino, name string) []byte {
 	return m.fmtKey("A", parent, "D", name)
+}
+
+func (m *kvMeta) parentKey(inode, parent Ino) []byte {
+	return m.fmtKey("A", inode, "P", parent)
 }
 
 func (m *kvMeta) chunkKey(inode Ino, indx uint32) []byte {
@@ -342,7 +347,7 @@ func (m *kvMeta) Init(format Format, force bool) error {
 
 	data, err := json.MarshalIndent(format, "", "")
 	if err != nil {
-		logger.Fatalf("json: %s", err)
+		return fmt.Errorf("json: %s", err)
 	}
 
 	m.fmt = format
@@ -559,7 +564,7 @@ func (m *kvMeta) getSession(sid uint64, detail bool) (*Session, error) {
 	return &s, nil
 }
 
-func (m *kvMeta) GetSession(sid uint64) (*Session, error) {
+func (m *kvMeta) GetSession(sid uint64, detail bool) (*Session, error) {
 	var legacy bool
 	value, err := m.get(m.sessionKey(sid))
 	if err == nil && value == nil {
@@ -572,7 +577,7 @@ func (m *kvMeta) GetSession(sid uint64) (*Session, error) {
 	if value == nil {
 		return nil, fmt.Errorf("session not found: %d", sid)
 	}
-	s, err := m.getSession(sid, true)
+	s, err := m.getSession(sid, detail)
 	if err != nil {
 		return nil, err
 	}
@@ -627,12 +632,16 @@ func (m *kvMeta) shouldRetry(err error) bool {
 	return m.client.shouldRetry(err)
 }
 
-func (m *kvMeta) txn(f func(tx kvTxn) error) error {
+func (m *kvMeta) txn(f func(tx kvTxn) error, inodes ...Ino) error {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
 	}
 	start := time.Now()
 	defer func() { txDist.Observe(time.Since(start).Seconds()) }()
+	if len(inodes) > 0 {
+		m.txLock(int(inodes[0]))
+		defer m.txUnlock(int(inodes[0]))
+	}
 	var err error
 	for i := 0; i < 50; i++ {
 		if err = m.client.txn(f); m.shouldRetry(err) {
@@ -1024,14 +1033,21 @@ func (m *kvMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 			return syscall.EEXIST
 		}
 
+		var updateParent bool
 		now := time.Now()
-		if _type == TypeDirectory {
-			pattr.Nlink++
+		if parent != TrashInode {
+			if _type == TypeDirectory {
+				pattr.Nlink++
+				updateParent = true
+			}
+			if updateParent || now.Sub(time.Unix(pattr.Mtime, int64(pattr.Mtimensec))) >= minUpdateTime {
+				pattr.Mtime = now.Unix()
+				pattr.Mtimensec = uint32(now.Nanosecond())
+				pattr.Ctime = now.Unix()
+				pattr.Ctimensec = uint32(now.Nanosecond())
+				updateParent = true
+			}
 		}
-		pattr.Mtime = now.Unix()
-		pattr.Mtimensec = uint32(now.Nanosecond())
-		pattr.Ctime = now.Unix()
-		pattr.Ctimensec = uint32(now.Nanosecond())
 		attr.Atime = now.Unix()
 		attr.Atimensec = uint32(now.Nanosecond())
 		attr.Mtime = now.Unix()
@@ -1046,7 +1062,7 @@ func (m *kvMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 		}
 
 		tx.set(m.entryKey(parent, name), m.packEntry(_type, ino))
-		if parent != TrashInode {
+		if updateParent {
 			tx.set(m.inodeKey(parent), m.marshal(&pattr))
 		}
 		tx.set(m.inodeKey(ino), m.marshal(attr))
@@ -1054,7 +1070,7 @@ func (m *kvMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 			tx.set(m.symKey(ino), []byte(path))
 		}
 		return nil
-	})
+	}, parent)
 	if err == nil {
 		m.updateStats(align4K(0), 1)
 	}
@@ -1110,27 +1126,38 @@ func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string) syscall.Errno {
 				if _type == TypeFile && attr.Nlink == 0 {
 					opened = m.of.IsOpen(inode)
 				}
-			} else if attr.Nlink == 1 {
+			} else if attr.Parent > 0 {
 				attr.Parent = trash
 			}
 		} else {
 			logger.Warnf("no attribute for inode %d (%d, %s)", inode, parent, name)
 			trash = 0
 		}
+
 		defer func() { m.of.InvalidateChunk(inode, 0xFFFFFFFE) }()
-		pattr.Mtime = now.Unix()
-		pattr.Mtimensec = uint32(now.Nanosecond())
-		pattr.Ctime = now.Unix()
-		pattr.Ctimensec = uint32(now.Nanosecond())
+		var updateParent bool
+		if !isTrash(parent) && now.Sub(time.Unix(pattr.Mtime, int64(pattr.Mtimensec))) >= minUpdateTime {
+			pattr.Mtime = now.Unix()
+			pattr.Mtimensec = uint32(now.Nanosecond())
+			pattr.Ctime = now.Unix()
+			pattr.Ctimensec = uint32(now.Nanosecond())
+			updateParent = true
+		}
 
 		tx.dels(m.entryKey(parent, name))
-		if !isTrash(parent) {
+		if updateParent {
 			tx.set(m.inodeKey(parent), m.marshal(&pattr))
 		}
 		if attr.Nlink > 0 {
 			tx.set(m.inodeKey(inode), m.marshal(&attr))
 			if trash > 0 {
-				tx.set(m.entryKey(trash, fmt.Sprintf("%d-%d-%s", parent, inode, name)), buf)
+				tx.set(m.entryKey(trash, m.trashEntry(parent, inode, name)), buf)
+				if attr.Parent == 0 {
+					tx.incrBy(m.parentKey(inode, trash), 1)
+				}
+			}
+			if attr.Parent == 0 {
+				tx.incrBy(m.parentKey(inode, parent), -1)
 			}
 		} else {
 			switch _type {
@@ -1151,9 +1178,12 @@ func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string) syscall.Errno {
 				newSpace, newInode = -align4K(0), -1
 			}
 			tx.dels(tx.scanKeys(m.xattrKey(inode, ""))...)
+			if attr.Parent == 0 {
+				tx.dels(tx.scanKeys(m.fmtKey("A", inode, "P"))...)
+			}
 		}
 		return nil
-	})
+	}, parent)
 	if err == nil && trash == 0 {
 		if _type == TypeFile && attr.Nlink == 0 {
 			m.fileDeleted(opened, inode, attr.Length)
@@ -1223,13 +1253,13 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string) syscall.Errno {
 		tx.dels(m.entryKey(parent, name))
 		if trash > 0 {
 			tx.set(m.inodeKey(inode), m.marshal(&attr))
-			tx.set(m.entryKey(trash, fmt.Sprintf("%d-%d-%s", parent, inode, name)), buf)
+			tx.set(m.entryKey(trash, m.trashEntry(parent, inode, name)), buf)
 		} else {
 			tx.dels(m.inodeKey(inode))
 			tx.dels(tx.scanKeys(m.xattrKey(inode, ""))...)
 		}
 		return nil
-	})
+	}, parent)
 	if err == nil && trash == 0 {
 		m.updateStats(-align4K(0), -1)
 	}
@@ -1287,6 +1317,7 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 				dbuf = m.packEntry(e.Attr.Typ, e.Inode)
 			}
 		}
+		var supdate, dupdate bool
 		now := time.Now()
 		tattr = Attr{}
 		opened = false
@@ -1304,10 +1335,15 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 			tattr.Ctime = now.Unix()
 			tattr.Ctimensec = uint32(now.Nanosecond())
 			if exchange {
-				tattr.Parent = parentSrc
-				if dtyp == TypeDirectory && parentSrc != parentDst {
-					dattr.Nlink--
-					sattr.Nlink++
+				if parentSrc != parentDst {
+					if dtyp == TypeDirectory {
+						tattr.Parent = parentSrc
+						dattr.Nlink--
+						sattr.Nlink++
+						supdate, dupdate = true, true
+					} else if tattr.Parent > 0 {
+						tattr.Parent = parentSrc
+					}
 				}
 			} else {
 				if dtyp == TypeDirectory {
@@ -1315,6 +1351,7 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 						return syscall.ENOTEMPTY
 					}
 					dattr.Nlink--
+					dupdate = true
 					if trash > 0 {
 						tattr.Parent = trash
 					}
@@ -1325,7 +1362,7 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 							opened = m.of.IsOpen(dino)
 						}
 						defer func() { m.of.InvalidateChunk(dino, 0xFFFFFFFE) }()
-					} else if tattr.Nlink == 1 {
+					} else if tattr.Parent > 0 {
 						tattr.Parent = trash
 					}
 				}
@@ -1343,21 +1380,32 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 			return syscall.EACCES
 		}
 
-		sattr.Mtime = now.Unix()
-		sattr.Mtimensec = uint32(now.Nanosecond())
-		sattr.Ctime = now.Unix()
-		sattr.Ctimensec = uint32(now.Nanosecond())
-		dattr.Mtime = now.Unix()
-		dattr.Mtimensec = uint32(now.Nanosecond())
-		dattr.Ctime = now.Unix()
-		dattr.Ctimensec = uint32(now.Nanosecond())
-		iattr.Parent = parentDst
+		if parentSrc != parentDst {
+			if typ == TypeDirectory {
+				iattr.Parent = parentDst
+				sattr.Nlink--
+				dattr.Nlink++
+				supdate, dupdate = true, true
+			} else if iattr.Parent > 0 {
+				iattr.Parent = parentDst
+			}
+		}
+		if supdate || now.Sub(time.Unix(sattr.Mtime, int64(sattr.Mtimensec))) >= minUpdateTime {
+			sattr.Mtime = now.Unix()
+			sattr.Mtimensec = uint32(now.Nanosecond())
+			sattr.Ctime = now.Unix()
+			sattr.Ctimensec = uint32(now.Nanosecond())
+			supdate = true
+		}
+		if dupdate || now.Sub(time.Unix(dattr.Mtime, int64(dattr.Mtimensec))) >= minUpdateTime {
+			dattr.Mtime = now.Unix()
+			dattr.Mtimensec = uint32(now.Nanosecond())
+			dattr.Ctime = now.Unix()
+			dattr.Ctimensec = uint32(now.Nanosecond())
+			dupdate = true
+		}
 		iattr.Ctime = now.Unix()
 		iattr.Ctimensec = uint32(now.Nanosecond())
-		if typ == TypeDirectory && parentSrc != parentDst {
-			sattr.Nlink--
-			dattr.Nlink++
-		}
 		if inode != nil {
 			*inode = ino
 		}
@@ -1368,14 +1416,25 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 		if exchange { // dino > 0
 			tx.set(m.entryKey(parentSrc, nameSrc), dbuf)
 			tx.set(m.inodeKey(dino), m.marshal(&tattr))
+			if parentSrc != parentDst && tattr.Parent == 0 {
+				tx.incrBy(m.parentKey(dino, parentSrc), 1)
+				tx.incrBy(m.parentKey(dino, parentDst), -1)
+			}
 		} else {
 			tx.dels(m.entryKey(parentSrc, nameSrc))
 			if dino > 0 {
 				if trash > 0 {
 					tx.set(m.inodeKey(dino), m.marshal(&tattr))
-					tx.set(m.entryKey(trash, fmt.Sprintf("%d-%d-%s", parentDst, dino, nameDst)), dbuf)
+					tx.set(m.entryKey(trash, m.trashEntry(parentDst, dino, nameDst)), dbuf)
+					if tattr.Parent == 0 {
+						tx.incrBy(m.parentKey(dino, trash), 1)
+						tx.incrBy(m.parentKey(dino, parentDst), -1)
+					}
 				} else if dtyp != TypeDirectory && tattr.Nlink > 0 {
 					tx.set(m.inodeKey(dino), m.marshal(&tattr))
+					if tattr.Parent == 0 {
+						tx.incrBy(m.parentKey(dino, parentDst), -1)
+					}
 				} else {
 					if dtyp == TypeFile {
 						if opened {
@@ -1394,17 +1453,28 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 						newSpace, newInode = -align4K(0), -1
 					}
 					tx.dels(tx.scanKeys(m.xattrKey(dino, ""))...)
+					if tattr.Parent == 0 {
+						tx.dels(tx.scanKeys(m.fmtKey("A", dino, "P"))...)
+					}
 				}
 			}
 		}
-		if parentDst != parentSrc && !isTrash(parentSrc) {
-			tx.set(m.inodeKey(parentSrc), m.marshal(&sattr))
+		if parentDst != parentSrc {
+			if !isTrash(parentSrc) && supdate {
+				tx.set(m.inodeKey(parentSrc), m.marshal(&sattr))
+			}
+			if iattr.Parent == 0 {
+				tx.incrBy(m.parentKey(ino, parentDst), 1)
+				tx.incrBy(m.parentKey(ino, parentSrc), -1)
+			}
 		}
 		tx.set(m.inodeKey(ino), m.marshal(&iattr))
 		tx.set(m.entryKey(parentDst, nameDst), buf)
-		tx.set(m.inodeKey(parentDst), m.marshal(&dattr))
+		if dupdate {
+			tx.set(m.inodeKey(parentDst), m.marshal(&dattr))
+		}
 		return nil
-	})
+	}, parentSrc)
 	if err == nil && !exchange && trash == 0 {
 		if dino > 0 && dtyp == TypeFile && tattr.Nlink == 0 {
 			m.fileDeleted(opened, dino, tattr.Length)
@@ -1434,27 +1504,39 @@ func (m *kvMeta) doLink(ctx Context, inode, parent Ino, name string, attr *Attr)
 			return syscall.EEXIST
 		}
 
+		var updateParent bool
 		now := time.Now()
-		pattr.Mtime = now.Unix()
-		pattr.Mtimensec = uint32(now.Nanosecond())
-		pattr.Ctime = now.Unix()
-		pattr.Ctimensec = uint32(now.Nanosecond())
+		if now.Sub(time.Unix(pattr.Mtime, int64(pattr.Mtimensec))) >= minUpdateTime {
+			pattr.Mtime = now.Unix()
+			pattr.Mtimensec = uint32(now.Nanosecond())
+			pattr.Ctime = now.Unix()
+			pattr.Ctimensec = uint32(now.Nanosecond())
+			updateParent = true
+		}
+		oldParent := iattr.Parent
+		iattr.Parent = 0
 		iattr.Ctime = now.Unix()
 		iattr.Ctimensec = uint32(now.Nanosecond())
 		iattr.Nlink++
 		tx.set(m.entryKey(parent, name), m.packEntry(iattr.Typ, inode))
-		tx.set(m.inodeKey(parent), m.marshal(&pattr))
+		if updateParent {
+			tx.set(m.inodeKey(parent), m.marshal(&pattr))
+		}
 		tx.set(m.inodeKey(inode), m.marshal(&iattr))
+		if oldParent > 0 {
+			tx.incrBy(m.parentKey(inode, oldParent), 1)
+		}
+		tx.incrBy(m.parentKey(inode, parent), 1)
 		if attr != nil {
 			*attr = iattr
 		}
 		return nil
-	}))
+	}, parent))
 }
 
-func (m *kvMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*Entry) syscall.Errno {
+func (m *kvMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*Entry, limit int) syscall.Errno {
 	// TODO: handle big directory
-	vals, err := m.scanValues(m.entryKey(inode, ""), -1, nil)
+	vals, err := m.scanValues(m.entryKey(inode, ""), limit, nil)
 	if err != nil {
 		return errno(err)
 	}
@@ -1546,7 +1628,7 @@ func (m *kvMeta) doDeleteSustainedInode(sid uint64, inode Ino) error {
 	})
 	if err == nil {
 		m.updateStats(newSpace, -1)
-		go m.doDeleteFileData(inode, attr.Length)
+		m.tryDeleteFileData(inode, attr.Length)
 	}
 	return err
 }
@@ -1615,7 +1697,7 @@ func (m *kvMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Sl
 		tx.set(m.inodeKey(inode), m.marshal(&attr))
 		needCompact = (len(val)/sliceBytes)%100 == 99
 		return nil
-	})
+	}, inode)
 	if err == nil {
 		if needCompact {
 			go m.compactChunk(inode, indx, false)
@@ -1733,6 +1815,22 @@ func (m *kvMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, off
 	return errno(err)
 }
 
+func (m *kvMeta) doGetParents(ctx Context, inode Ino) map[Ino]int {
+	vals, err := m.scanValues(m.fmtKey("A", inode, "P"), -1, func(k, v []byte) bool {
+		// parents: AiiiiiiiiPiiiiiiii
+		return len(k) == 1+8+1+8 && parseCounter(v) > 0
+	})
+	if err != nil {
+		logger.Warnf("Scan parent key of inode %d: %s", inode, err)
+		return nil
+	}
+	ps := make(map[Ino]int)
+	for k, v := range vals {
+		ps[m.decodeInode([]byte(k[10:]))] = int(parseCounter(v))
+	}
+	return ps
+}
+
 func (m *kvMeta) doFindDeletedFiles(ts int64, limit int) (map[Ino]uint64, error) {
 	klen := 1 + 8 + 8
 	vals, err := m.scanValues(m.fmtKey("D"), limit, func(k, v []byte) bool {
@@ -1777,13 +1875,12 @@ func (m *kvMeta) deleteChunk(inode Ino, indx uint32) error {
 		slices := readSliceBuf(buf)
 		tx.dels(key)
 		for _, s := range slices {
-			r := tx.incrBy(m.sliceKey(s.chunkid, s.size), -1)
-			if r < 0 {
+			if s.chunkid > 0 && tx.incrBy(m.sliceKey(s.chunkid, s.size), -1) < 0 {
 				todel = append(todel, s)
 			}
 		}
 		return nil
-	})
+	}, inode)
 	if err != nil {
 		return err
 	}
@@ -1822,26 +1919,26 @@ func (m *kvMeta) doDeleteFileData(inode Ino, length uint64) {
 }
 
 func (m *kvMeta) doCleanupDelayedSlices(edge int64, limit int) (int, error) {
-	// delayed slices: Lcccccccctttttttt
-	keys, err := m.scanKeys(m.fmtKey("L"))
-	if err != nil {
+	var keys [][]byte
+	if err := m.client.txn(func(tx kvTxn) error {
+		vals := tx.scanRange(m.delSliceKey(0, 0), m.delSliceKey(edge, 0))
+		for k := range vals {
+			if len(k) != 1+8+8 { // delayed slices: Lttttttttcccccccc
+				continue
+			}
+			keys = append(keys, []byte(k))
+		}
+		return nil
+	}); err != nil {
 		logger.Warnf("Scan delayed slices: %s", err)
 		return 0, err
 	}
 
-	klen := 1 + 8 + 8
 	var count int
 	var ss []Slice
 	var rs []int64
 	for _, key := range keys {
-		if len(key) != klen {
-			continue
-		}
-		if m.parseInt64(key[9:]) >= edge {
-			continue
-		}
-
-		if err = m.txn(func(tx kvTxn) error {
+		if err := m.txn(func(tx kvTxn) error {
 			buf := tx.get(key)
 			if len(buf) == 0 {
 				return nil
@@ -1942,7 +2039,9 @@ func (m *kvMeta) compactChunk(inode Ino, indx uint32, force bool) {
 			tx.set(m.delSliceKey(time.Now().Unix(), chunkid), dsbuf)
 		} else {
 			for _, s := range ss {
-				tx.incrBy(m.sliceKey(s.chunkid, s.size), -1)
+				if s.chunkid > 0 {
+					tx.incrBy(m.sliceKey(s.chunkid, s.size), -1)
+				}
 			}
 		}
 		return nil
@@ -1970,7 +2069,7 @@ func (m *kvMeta) compactChunk(inode Ino, indx uint32, force bool) {
 		if !trash {
 			var refs int64
 			for _, s := range ss {
-				if m.client.txn(func(tx kvTxn) error {
+				if s.chunkid > 0 && m.client.txn(func(tx kvTxn) error {
 					refs = tx.incrBy(m.sliceKey(s.chunkid, s.size), 0)
 					return nil
 				}) == nil && refs < 0 {
@@ -2041,8 +2140,11 @@ func (m *kvMeta) ListSlices(ctx Context, slices map[Ino][]Slice, delete bool, sh
 			}
 		}
 	}
+	if m.fmt.TrashDays == 0 {
+		return 0
+	}
 
-	// delayed slices: Lcccccccctttttttt
+	// delayed slices: Lttttttttcccccccc
 	klen = 1 + 8 + 8
 	result, err = m.scanValues(m.fmtKey("L"), -1, func(k, v []byte) bool {
 		return len(k) == klen
@@ -2120,14 +2222,15 @@ func (m *kvMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 }
 
 func (m *kvMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
-	value, err := m.get(m.xattrKey(inode, name))
-	if err != nil {
-		return errno(err)
-	}
-	if value == nil {
-		return ENOATTR
-	}
-	return errno(m.deleteKeys(m.xattrKey(inode, name)))
+	key := m.xattrKey(inode, name)
+	return errno(m.txn(func(tx kvTxn) error {
+		value := tx.get(key)
+		if value == nil {
+			return ENOATTR
+		}
+		tx.dels(key)
+		return nil
+	}))
 }
 
 func (m *kvMeta) dumpEntry(inode Ino, typ uint8) (*DumpedEntry, error) {
@@ -2277,26 +2380,26 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino) (err error) {
 			defer func() { m.snap = nil }()
 			m.snap = &memKV{items: btree.New(2), temp: &kvItem{}}
 			bar := progress.AddCountBar("Snapshot keys", 0)
-			if err = m.txn(func(tx kvTxn) error {
-				used := parseCounter(tx.get(m.counterKey(usedSpace)))
-				inodeTotal := parseCounter(tx.get(m.counterKey(totalInodes)))
-				var guessKeyTotal int64 = 3 // setting, nextInode, nextChunk
-				if inodeTotal > 0 {
-					guessKeyTotal += int64(math.Ceil((float64(used/inodeTotal/(64*1024*1024)) + float64(3)) * float64(inodeTotal)))
+			bUsed, _ := m.get(m.counterKey(usedSpace))
+			bInodes, _ := m.get(m.counterKey(totalInodes))
+			used := parseCounter(bUsed)
+			inodeTotal := parseCounter(bInodes)
+			var guessKeyTotal int64 = 3 // setting, nextInode, nextChunk
+			if inodeTotal > 0 {
+				guessKeyTotal += int64(math.Ceil((float64(used/inodeTotal/(64*1024*1024)) + float64(3)) * float64(inodeTotal)))
+			}
+			bar.SetCurrent(0) // Reset
+			bar.SetTotal(guessKeyTotal)
+			threshold := 0.1
+			err := m.client.scan(nil, func(key, value []byte) {
+				m.snap.set(string(key), value)
+				if bar.Current() > int64(math.Ceil(float64(guessKeyTotal)*(1-threshold))) {
+					guessKeyTotal += int64(math.Ceil(float64(guessKeyTotal) * threshold))
+					bar.SetTotal(guessKeyTotal)
 				}
-				bar.SetCurrent(0) // Reset
-				bar.SetTotal(guessKeyTotal)
-				threshold := 0.1
-				tx.scan(nil, func(key, value []byte) {
-					m.snap.set(string(key), value)
-					if bar.Current() > int64(math.Ceil(float64(guessKeyTotal)*(1-threshold))) {
-						guessKeyTotal += int64(math.Ceil(float64(guessKeyTotal) * threshold))
-						bar.SetTotal(guessKeyTotal)
-					}
-					bar.Increment()
-				})
-				return nil
-			}); err != nil {
+				bar.Increment()
+			})
+			if err != nil {
 				return err
 			}
 			bar.Done()
@@ -2415,7 +2518,14 @@ func (m *kvMeta) loadEntry(e *DumpedEntry, cs *DumpedCounters, refs map[string]i
 	inode := e.Attr.Inode
 	logger.Debugf("Loading entry inode %d name %s", inode, unescape(e.Name))
 	attr := loadAttr(e.Attr)
-	attr.Parent = e.Parent
+	numParents := len(e.Parents)
+	if numParents == 1 {
+		attr.Parent = e.Parents[0]
+	} else if numParents == 0 {
+		logger.Fatalf("No parent for inode: %d", inode)
+	} else if attr.Typ == TypeDirectory {
+		logger.Fatalf("Too many parents for directory inode %d: %v", inode, e.Parents)
+	}
 	return m.txn(func(tx kvTxn) error {
 		if attr.Typ == TypeFile {
 			attr.Length = e.Attr.Length
@@ -2463,6 +2573,11 @@ func (m *kvMeta) loadEntry(e *DumpedEntry, cs *DumpedCounters, refs map[string]i
 
 		for _, x := range e.Xattrs {
 			tx.set(m.xattrKey(inode, x.Name), []byte(unescape(x.Value)))
+		}
+		if numParents > 1 {
+			for _, parent := range e.Parents {
+				tx.incrBy(m.parentKey(inode, parent), 1)
+			}
 		}
 		tx.set(m.inodeKey(inode), m.marshal(attr))
 		return nil

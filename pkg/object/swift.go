@@ -20,12 +20,15 @@
 package object
 
 import (
+	"errors"
 	"fmt"
-	"github.com/juicedata/juicefs/pkg/utils"
-	"github.com/ncw/swift"
 	"io"
 	"net/url"
+	"os"
 	"strings"
+
+	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/ncw/swift"
 )
 
 type swiftOSS struct {
@@ -65,7 +68,11 @@ func (s *swiftOSS) Put(key string, in io.Reader) error {
 }
 
 func (s *swiftOSS) Delete(key string) error {
-	return s.conn.ObjectDelete(s.container, key)
+	err := s.conn.ObjectDelete(s.container, key)
+	if err != nil && errors.Is(err, swift.ObjectNotFound) {
+		err = nil
+	}
+	return err
 }
 
 func (s *swiftOSS) List(prefix, marker string, limit int64) ([]Object, error) {
@@ -85,6 +92,9 @@ func (s *swiftOSS) List(prefix, marker string, limit int64) ([]Object, error) {
 
 func (s *swiftOSS) Head(key string) (Object, error) {
 	object, _, err := s.conn.Object(s.container, key)
+	if err == swift.ObjectNotFound {
+		err = os.ErrNotExist
+	}
 	return &obj{
 		key,
 		object.Bytes,

@@ -22,8 +22,8 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/go-redis/redis/v8"
 	"io/ioutil"
 	"math"
 	"os"
@@ -31,6 +31,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-redis/redis/v8"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func get(s ObjectStorage, k string, off, limit int64) (string, error) {
@@ -47,7 +50,7 @@ func get(s ObjectStorage, k string, off, limit int64) (string, error) {
 
 func listAll(s ObjectStorage, prefix, marker string, limit int64) ([]Object, error) {
 	r, err := s.List(prefix, marker, limit)
-	if err == nil {
+	if !errors.Is(err, notSupported) {
 		return r, nil
 	}
 	ch, err := s.ListAll(prefix, marker)
@@ -68,7 +71,9 @@ func testStorage(t *testing.T, s ObjectStorage) {
 	if err := s.Create(); err != nil {
 		t.Fatalf("Can't create bucket %s: %s", s, err)
 	}
-
+	if err := s.Create(); err != nil {
+		t.Fatalf("err should be nil when creating a bucket with the same name")
+	}
 	s = WithPrefix(s, "unit-test/")
 	defer s.Delete("test")
 	k := "large"
@@ -85,16 +90,22 @@ func testStorage(t *testing.T, s ObjectStorage) {
 	}
 
 	if d, e := get(s, "test", 0, -1); d != "hello" {
-		t.Fatalf("expect hello, but got %v, error:%s", d, e)
+		t.Fatalf("expect hello, but got %v, error: %s", d, e)
+	}
+	if d, e := get(s, "test", 2, -1); d != "llo" {
+		t.Logf("expect llo, but got %v, error: %s", d, e)
 	}
 	if d, e := get(s, "test", 2, 3); d != "llo" {
-		t.Fatalf("expect llo, but got %v, error:%s", d, e)
+		t.Fatalf("expect llo, but got %v, error: %s", d, e)
 	}
 	if d, e := get(s, "test", 2, 2); d != "ll" {
-		t.Fatalf("expect ll, but got %v, error:%s", d, e)
+		t.Fatalf("expect ll, but got %v, error: %s", d, e)
 	}
 	if d, e := get(s, "test", 4, 2); d != "o" {
-		t.Errorf("out-of-range get: 'o', but got %v, error:%s", len(d), e)
+		t.Errorf("out-of-range get: 'o', but got %v, error: %s", len(d), e)
+	}
+	if d, e := get(s, "test", 6, 2); d != "" {
+		t.Errorf("out-of-range get: '', but got %v, error: %s", len(d), e)
 	}
 	switch s.(*withPrefix).os.(type) {
 	case FileSystem:
@@ -168,6 +179,10 @@ func testStorage(t *testing.T, s ObjectStorage) {
 		t.Fatalf("file should exists")
 	} else {
 		s.Delete("file")
+	}
+
+	if _, err := s.Head("not-exist-file"); !os.IsNotExist(err) {
+		t.Fatal("err should be os.ErrNotExist")
 	}
 
 	if _, err := s.Head("test"); err != nil {
@@ -558,6 +573,28 @@ func TestSharding(t *testing.T) {
 	testStorage(t, s)
 }
 
+func TestSQLite(t *testing.T) {
+	s, err := newSQLStore("sqlite3", "/tmp/teststore.db", "", "")
+	if err != nil {
+		t.Fatalf("create: %s", err)
+	}
+	testStorage(t, s)
+}
+
+func TestPG(t *testing.T) {
+	s, err := newSQLStore("postgres", "localhost:5432/test?sslmode=disable", "", "")
+	if err == nil {
+		testStorage(t, s)
+	}
+}
+
+func TestMySQL(t *testing.T) {
+	s, err := newSQLStore("mysql", "/dev", "root", "")
+	if err == nil {
+		testStorage(t, s)
+	}
+}
+
 func TestNameString(t *testing.T) {
 	s, _ := newMem("test", "", "")
 	s = WithPrefix(s, "a/")
@@ -565,4 +602,9 @@ func TestNameString(t *testing.T) {
 	if s.String() != "mem://test/a/b/" {
 		t.Fatalf("name with two prefix does not match: %s", s.String())
 	}
+}
+
+func TestEtcd(t *testing.T) {
+	s, _ := newEtcd("127.0.0.1:2379", "", "")
+	testStorage(t, s)
 }

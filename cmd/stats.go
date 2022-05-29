@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package main
+package cmd
 
 import (
 	"fmt"
@@ -76,6 +76,7 @@ const (
 	MAGENTA
 	CYAN
 	WHITE
+	DEFAULT = "00"
 )
 
 const (

@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -52,6 +53,9 @@ func (r *redisStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	data, err := r.rdb.Get(c, key).Bytes()
 	if err != nil {
 		return nil, err
+	}
+	if off > int64(len(data)) {
+		off = int64(len(data))
 	}
 	data = data[off:]
 	if limit > 0 && limit < int64(len(data)) {
@@ -145,6 +149,9 @@ func (t *redisStore) ListAll(prefix, marker string) (<-chan Object, error) {
 
 func (t *redisStore) Head(key string) (Object, error) {
 	data, err := t.rdb.Get(context.TODO(), key).Bytes()
+	if err == redis.Nil {
+		return nil, os.ErrNotExist
+	}
 	return &obj{
 		key,
 		int64(len(data)),

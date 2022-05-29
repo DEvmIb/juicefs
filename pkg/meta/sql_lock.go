@@ -38,13 +38,14 @@ func (m *dbMeta) Flock(ctx Context, inode Ino, owner_ uint64, ltype uint32, bloc
 	var err syscall.Errno
 	for {
 		err = errno(m.txn(func(s *xorm.Session) error {
-			if exists, err := s.Get(&node{Inode: inode}); err != nil || !exists {
+			if exists, err := s.ForUpdate().Get(&node{Inode: inode}); err != nil || !exists {
 				if err == nil && !exists {
 					err = syscall.ENOENT
 				}
 				return err
 			}
-			rows, err := s.Rows(&flock{Inode: inode})
+			var fs []flock
+			err := s.ForUpdate().Find(&fs, &flock{Inode: inode})
 			if err != nil {
 				return err
 			}
@@ -53,13 +54,9 @@ func (m *dbMeta) Flock(ctx Context, inode Ino, owner_ uint64, ltype uint32, bloc
 				o   int64
 			}
 			var locks = make(map[key]flock)
-			var l flock
-			for rows.Next() {
-				if rows.Scan(&l) == nil {
-					locks[key{l.Sid, l.Owner}] = l
-				}
+			for _, l := range fs {
+				locks[key{l.Sid, l.Owner}] = l
 			}
-			_ = rows.Close()
 
 			if ltype == F_RDLCK {
 				for _, l := range locks {
@@ -85,7 +82,7 @@ func (m *dbMeta) Flock(ctx Context, inode Ino, owner_ uint64, ltype uint32, bloc
 				err = fmt.Errorf("insert/update failed")
 			}
 			return err
-		}))
+		}, inode))
 
 		if !block || err != syscall.EAGAIN {
 			break
@@ -159,7 +156,7 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 	owner := int64(owner_)
 	for {
 		err = errno(m.txn(func(s *xorm.Session) error {
-			if exists, err := s.Get(&node{Inode: inode}); err != nil || !exists {
+			if exists, err := s.ForUpdate().Get(&node{Inode: inode}); err != nil || !exists {
 				if err == nil && !exists {
 					err = syscall.ENOENT
 				}
@@ -167,7 +164,7 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 			}
 			if ltype == F_UNLCK {
 				var l = plock{Inode: inode, Owner: owner, Sid: m.sid}
-				ok, err := m.db.Get(&l)
+				ok, err := s.ForUpdate().Get(&l)
 				if err != nil {
 					return err
 				}
@@ -186,7 +183,8 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 				}
 				return err
 			}
-			rows, err := s.Rows(&plock{Inode: inode})
+			var ps []plock
+			err := s.ForUpdate().Find(&ps, &plock{Inode: inode})
 			if err != nil {
 				return err
 			}
@@ -195,14 +193,9 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 				owner int64
 			}
 			var locks = make(map[key][]byte)
-			var l plock
-			for rows.Next() {
-				l.Records = nil
-				if rows.Scan(&l) == nil {
-					locks[key{l.Sid, l.Owner}] = dup(l.Records)
-				}
+			for _, l := range ps {
+				locks[key{l.Sid, l.Owner}] = l.Records
 			}
-			_ = rows.Close()
 			lkey := key{m.sid, owner}
 			for k, d := range locks {
 				if k == lkey {
@@ -228,7 +221,7 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 				err = fmt.Errorf("insert/update failed")
 			}
 			return err
-		}))
+		}, inode))
 
 		if !block || err != syscall.EAGAIN {
 			break
