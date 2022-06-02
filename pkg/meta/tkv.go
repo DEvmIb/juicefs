@@ -26,6 +26,7 @@ import (
 	"math"
 	"math/rand"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -33,8 +34,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-
-	"github.com/google/btree"
 
 	"github.com/juicedata/juicefs/pkg/utils"
 )
@@ -64,7 +63,7 @@ type tkvClient interface {
 type kvMeta struct {
 	baseMeta
 	client tkvClient
-	snap   *memKV
+	snap   map[Ino]*DumpedEntry
 }
 
 var drivers = make(map[string]func(string) (tkvClient, error))
@@ -2233,17 +2232,22 @@ func (m *kvMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 	}))
 }
 
-func (m *kvMeta) dumpEntry(inode Ino, typ uint8) (*DumpedEntry, error) {
-	e := &DumpedEntry{}
-	f := func(tx kvTxn) error {
+func (m *kvMeta) dumpEntry(inode Ino, e *DumpedEntry) error {
+	if m.snap != nil {
+		return nil
+	}
+	return m.client.txn(func(tx kvTxn) error {
 		a := tx.get(m.inodeKey(inode))
 		if a == nil {
 			logger.Warnf("inode %d not found", inode)
 		}
 
-		attr := &Attr{Typ: typ, Nlink: 1}
+		attr := &Attr{Nlink: 1}
 		m.parseAttr(a, attr)
-		e.Attr = dumpAttr(attr)
+		if a == nil && e.Attr != nil {
+			attr.Typ = typeFromString(e.Attr.Type)
+		}
+		e.Attr = dumpAttr(attr) // TODO: reduce memory allocation
 		e.Attr.Inode = inode
 
 		vals := tx.scanValues(m.xattrKey(inode, ""), -1, nil)
@@ -2257,7 +2261,7 @@ func (m *kvMeta) dumpEntry(inode Ino, typ uint8) (*DumpedEntry, error) {
 		}
 
 		if attr.Typ == TypeFile {
-			vals = tx.scanRange(m.chunkKey(inode, 0), m.chunkKey(inode, uint32(attr.Length/ChunkSize)+1))
+			vals := tx.scanRange(m.chunkKey(inode, 0), m.chunkKey(inode, uint32(attr.Length/ChunkSize)+1))
 			for indx := uint32(0); uint64(indx)*ChunkSize < attr.Length; indx++ {
 				v, ok := vals[string(m.chunkKey(inode, indx))]
 				if !ok {
@@ -2278,12 +2282,7 @@ func (m *kvMeta) dumpEntry(inode Ino, typ uint8) (*DumpedEntry, error) {
 			e.Symlink = string(l)
 		}
 		return nil
-	}
-	if m.snap != nil {
-		return e, m.snap.txn(f)
-	} else {
-		return e, m.txn(f)
-	}
+	})
 }
 
 func (m *kvMeta) dumpDir(inode Ino, tree *DumpedEntry, bw *bufio.Writer, depth int, showProgress func(totalIncr, currentIncr int64)) error {
@@ -2292,40 +2291,46 @@ func (m *kvMeta) dumpDir(inode Ino, tree *DumpedEntry, bw *bufio.Writer, depth i
 			panic(err)
 		}
 	}
-	var vals map[string][]byte
+	var entries map[string]*DumpedEntry
 	var err error
-	if m.snap != nil {
-		err = m.snap.txn(func(tx kvTxn) error {
-			vals = tx.scanValues(m.entryKey(inode, ""), -1, nil)
-			return nil
-		})
-	} else {
-		vals, err = m.scanValues(m.entryKey(inode, ""), -1, nil)
-	}
-	if err != nil {
-		return err
-	}
-	if showProgress != nil {
-		showProgress(int64(len(vals)), 0)
-	}
-	if err = tree.writeJsonWithOutEntry(bw, depth); err != nil {
-		return err
-	}
 	var sortedName []string
-	for k := range vals {
-		sortedName = append(sortedName, k)
-	}
-	sort.Slice(sortedName, func(i, j int) bool { return sortedName[i][10:] < sortedName[j][10:] })
-
-	for idx, name := range sortedName {
-		typ, inode := m.parseEntry(vals[name])
-		var entry *DumpedEntry
-		entry, err = m.dumpEntry(inode, typ)
+	if m.snap != nil {
+		e := m.snap[inode]
+		entries = e.Entries
+		for n := range e.Entries {
+			sortedName = append(sortedName, n)
+		}
+	} else {
+		vals, err := m.scanValues(m.entryKey(inode, ""), -1, nil)
 		if err != nil {
 			return err
 		}
-		entry.Name = name[10:]
-		if typ == TypeDirectory {
+		entries = map[string]*DumpedEntry{}
+		for k, value := range vals {
+			name := k[10:]
+			typ, inode := m.parseEntry(value)
+			sortedName = append(sortedName, name)
+			entries[name] = &DumpedEntry{Name: name, Attr: &DumpedAttr{Inode: inode, Type: typeToString(typ)}}
+		}
+	}
+	sort.Slice(sortedName, func(i, j int) bool { return sortedName[i] < sortedName[j] })
+	if showProgress != nil && m.snap == nil {
+		showProgress(int64(len(entries)), 0)
+	}
+
+	if err = tree.writeJsonWithOutEntry(bw, depth); err != nil {
+		return err
+	}
+
+	for idx, name := range sortedName {
+		entry := entries[name]
+		entry.Name = name
+		inode := entry.Attr.Inode
+		err = m.dumpEntry(inode, entry)
+		if err != nil {
+			return err
+		}
+		if entry.Attr.Type == "directory" {
 			err = m.dumpDir(inode, entry, bw, depth+2, showProgress)
 		} else {
 			err = entry.writeJSON(bw, depth+2)
@@ -2333,7 +2338,7 @@ func (m *kvMeta) dumpDir(inode Ino, tree *DumpedEntry, bw *bufio.Writer, depth i
 		if err != nil {
 			return err
 		}
-		if idx != len(vals)-1 {
+		if idx != len(entries)-1 {
 			bwWrite(",")
 		}
 		if showProgress != nil {
@@ -2347,6 +2352,7 @@ func (m *kvMeta) dumpDir(inode Ino, tree *DumpedEntry, bw *bufio.Writer, depth i
 func (m *kvMeta) DumpMeta(w io.Writer, root Ino) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
+			debug.PrintStack()
 			if e, ok := p.(error); ok {
 				err = e
 			} else {
@@ -2372,46 +2378,86 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino) (err error) {
 	progress := utils.NewProgress(false, false)
 	var tree, trash *DumpedEntry
 	root = m.checkRoot(root)
+
 	if root == 1 { // make snap
-		switch c := m.client.(type) {
-		case *memKV:
-			m.snap = c
-		default:
-			defer func() { m.snap = nil }()
-			m.snap = &memKV{items: btree.New(2), temp: &kvItem{}}
-			bar := progress.AddCountBar("Snapshot keys", 0)
-			bUsed, _ := m.get(m.counterKey(usedSpace))
-			bInodes, _ := m.get(m.counterKey(totalInodes))
-			used := parseCounter(bUsed)
-			inodeTotal := parseCounter(bInodes)
-			var guessKeyTotal int64 = 3 // setting, nextInode, nextChunk
-			if inodeTotal > 0 {
-				guessKeyTotal += int64(math.Ceil((float64(used/inodeTotal/(64*1024*1024)) + float64(3)) * float64(inodeTotal)))
-			}
-			bar.SetCurrent(0) // Reset
-			bar.SetTotal(guessKeyTotal)
-			threshold := 0.1
-			err := m.client.scan(nil, func(key, value []byte) {
-				m.snap.set(string(key), value)
-				if bar.Current() > int64(math.Ceil(float64(guessKeyTotal)*(1-threshold))) {
-					guessKeyTotal += int64(math.Ceil(float64(guessKeyTotal) * threshold))
-					bar.SetTotal(guessKeyTotal)
+		m.snap = make(map[Ino]*DumpedEntry)
+		defer func() {
+			m.snap = nil
+		}()
+		bar := progress.AddCountBar("Scan keys", 0)
+		bUsed, _ := m.get(m.counterKey(usedSpace))
+		bInodes, _ := m.get(m.counterKey(totalInodes))
+		used := parseCounter(bUsed)
+		inodeTotal := parseCounter(bInodes)
+		var guessKeyTotal int64 = 3 // setting, nextInode, nextChunk
+		if inodeTotal > 0 {
+			guessKeyTotal += int64(math.Ceil((float64(used/inodeTotal/(64*1024*1024)) + float64(3)) * float64(inodeTotal)))
+		}
+		bar.SetCurrent(0) // Reset
+		bar.SetTotal(guessKeyTotal)
+		threshold := 0.1
+		var cnt int
+		err := m.client.scan(nil, func(key, value []byte) {
+			if len(key) > 9 && key[0] == 'A' {
+				ino := m.decodeInode(key[1:9])
+				e := m.snap[ino]
+				if e == nil {
+					e = &DumpedEntry{}
+					m.snap[ino] = e
 				}
-				bar.Increment()
-			})
-			if err != nil {
-				return err
+				switch key[9] {
+				case 'I':
+					attr := &Attr{Nlink: 1}
+					m.parseAttr(value, attr)
+					e.Attr = dumpAttr(attr)
+					e.Attr.Inode = ino
+				case 'C':
+					indx := binary.BigEndian.Uint32(key[10:])
+					ss := readSliceBuf(value)
+					slices := make([]*DumpedSlice, 0, len(ss))
+					for _, s := range ss {
+						slices = append(slices, &DumpedSlice{Chunkid: s.chunkid, Pos: s.pos, Size: s.size, Off: s.off, Len: s.len})
+					}
+					e.Chunks = append(e.Chunks, &DumpedChunk{indx, slices})
+				case 'D':
+					name := string(key[10:])
+					_, inode := m.parseEntry(value)
+					child := m.snap[inode]
+					if child == nil {
+						child = &DumpedEntry{}
+						m.snap[inode] = child
+					}
+					if e.Entries == nil {
+						e.Entries = map[string]*DumpedEntry{}
+					}
+					e.Entries[name] = child
+				case 'X':
+					e.Xattrs = append(e.Xattrs, &DumpedXattr{string(key[10:]), string(value)})
+				case 'S':
+					e.Symlink = string(value)
+				}
 			}
-			bar.Done()
+			cnt++
+			if cnt%100 == 0 && bar.Current() > int64(math.Ceil(float64(guessKeyTotal)*(1-threshold))) {
+				guessKeyTotal += int64(math.Ceil(float64(guessKeyTotal) * threshold))
+				bar.SetTotal(guessKeyTotal)
+			}
+			bar.Increment()
+		})
+		if err != nil {
+			return err
 		}
-		if trash, err = m.dumpEntry(TrashInode, TypeDirectory); err != nil {
-			trash = nil
+		bar.Done()
+		tree = m.snap[root]
+		trash = m.snap[TrashInode]
+	} else {
+		tree = &DumpedEntry{}
+		if err = m.dumpEntry(root, tree); err != nil {
+			return err
 		}
 	}
-	if tree, err = m.dumpEntry(root, TypeDirectory); err != nil {
-		return err
-	}
-	if tree == nil {
+
+	if tree == nil || tree.Attr == nil {
 		return errors.New("The entry of the root inode was not found")
 	}
 	tree.Name = "FSTree"
@@ -2436,14 +2482,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino) (err error) {
 		}
 	}
 
-	if root == 1 {
-		err = m.snap.txn(func(tx kvTxn) error {
-			vals = tx.scanValues(m.fmtKey("SS"), -1, nil)
-			return nil
-		})
-	} else {
-		vals, err = m.scanValues(m.fmtKey("SS"), -1, nil)
-	}
+	vals, err = m.scanValues(m.fmtKey("SS"), -1, nil)
 	if err != nil {
 		return err
 	}
@@ -2486,6 +2525,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino) (err error) {
 
 	bar := progress.AddCountBar("Dumped entries", 1) // with root
 	bar.Increment()
+	bar.SetTotal(int64(len(m.snap)))
 	if trash != nil {
 		trash.Name = "Trash"
 		bar.IncrTotal(1)
@@ -2514,74 +2554,149 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino) (err error) {
 	return bw.Flush()
 }
 
-func (m *kvMeta) loadEntry(e *DumpedEntry, cs *DumpedCounters, refs map[string]int64) error {
+type pair struct {
+	key   []byte
+	value []byte
+}
+
+func (m *kvMeta) loadEntry(e *DumpedEntry, kv chan *pair) error {
 	inode := e.Attr.Inode
-	logger.Debugf("Loading entry inode %d name %s", inode, unescape(e.Name))
 	attr := loadAttr(e.Attr)
-	numParents := len(e.Parents)
-	if numParents == 1 {
-		attr.Parent = e.Parents[0]
-	} else if numParents == 0 {
-		logger.Fatalf("No parent for inode: %d", inode)
+	attr.Nlink = 1
+	attr.Parent = e.Parents[0]
+	if attr.Typ == TypeFile {
+		attr.Length = e.Attr.Length
+		for _, c := range e.Chunks {
+			if len(c.Slices) == 0 {
+				continue
+			}
+			slices := make([]byte, 0, sliceBytes*len(c.Slices))
+			for _, s := range c.Slices {
+				slices = append(slices, marshalSlice(s.Pos, s.Chunkid, s.Size, s.Off, s.Len)...)
+			}
+			kv <- &pair{m.chunkKey(inode, c.Index), slices}
+		}
 	} else if attr.Typ == TypeDirectory {
-		logger.Fatalf("Too many parents for directory inode %d: %v", inode, e.Parents)
+		attr.Length = 4 << 10
+		nlink := uint32(2)
+		for name, c := range e.Entries {
+			kv <- &pair{m.entryKey(inode, string(unescape(name))), m.packEntry(typeFromString(c.Attr.Type), c.Attr.Inode)}
+			if c.Attr.Type == "directory" {
+				nlink++
+			}
+		}
+		attr.Nlink = nlink
+	} else if attr.Typ == TypeSymlink {
+		symL := unescape(e.Symlink)
+		attr.Length = uint64(len(symL))
+		kv <- &pair{m.symKey(inode), []byte(symL)}
 	}
-	return m.txn(func(tx kvTxn) error {
-		if attr.Typ == TypeFile {
-			attr.Length = e.Attr.Length
-			for _, c := range e.Chunks {
-				if len(c.Slices) == 0 {
-					continue
-				}
-				slices := make([]byte, 0, sliceBytes*len(c.Slices))
-				m.Lock()
-				for _, s := range c.Slices {
-					slices = append(slices, marshalSlice(s.Pos, s.Chunkid, s.Size, s.Off, s.Len)...)
-					refs[string(m.sliceKey(s.Chunkid, s.Size))]++
-					if cs.NextChunk <= int64(s.Chunkid) {
-						cs.NextChunk = int64(s.Chunkid) + 1
+	for _, x := range e.Xattrs {
+		kv <- &pair{m.xattrKey(inode, x.Name), []byte(unescape(x.Value))}
+	}
+	kv <- &pair{m.inodeKey(inode), m.marshal(attr)}
+	return nil
+}
+
+func (m *kvMeta) decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[Ino][]Ino,
+	refs map[chunkKey]int64, kv chan *pair, showProgress func(int64)) (*DumpedEntry, error) {
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	var e = DumpedEntry{}
+	for dec.More() {
+		name, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		switch name {
+		case "attr":
+			err = dec.Decode(&e.Attr)
+			if err == nil {
+				inode := e.Attr.Inode
+				e.Parents = append(parents[inode], parent)
+				parents[inode] = e.Parents
+				if len(e.Parents) == 1 {
+					if inode > 1 && inode != TrashInode {
+						cs.UsedSpace += align4K(e.Attr.Length)
+						cs.UsedInodes += 1
+					}
+					if inode < TrashInode {
+						if cs.NextInode <= int64(inode) {
+							cs.NextInode = int64(inode) + 1
+						}
+					} else {
+						if cs.NextTrash < int64(inode)-TrashInode {
+							cs.NextTrash = int64(inode) - TrashInode
+						}
 					}
 				}
-				m.Unlock()
-				tx.set(m.chunkKey(inode, c.Index), slices)
 			}
-		} else if attr.Typ == TypeDirectory {
-			attr.Length = 4 << 10
-			for _, c := range e.Entries {
-				tx.set(m.entryKey(inode, string(unescape(c.Name))), m.packEntry(typeFromString(c.Attr.Type), c.Attr.Inode))
+		case "chunks":
+			err = dec.Decode(&e.Chunks)
+			if err == nil && len(e.Parents) == 1 {
+				for _, c := range e.Chunks {
+					for _, s := range c.Slices {
+						refs[chunkKey{s.Chunkid, s.Size}]++
+						if cs.NextChunk <= int64(s.Chunkid) {
+							cs.NextChunk = int64(s.Chunkid) + 1
+						}
+					}
+				}
 			}
-		} else if attr.Typ == TypeSymlink {
-			symL := unescape(e.Symlink)
-			attr.Length = uint64(len(symL))
-			tx.set(m.symKey(inode), []byte(symL))
+		case "entries":
+			e.Entries = make(map[string]*DumpedEntry)
+			_, err = dec.Token()
+			if err == nil {
+				for dec.More() {
+					var n json.Token
+					n, err = dec.Token()
+					if err != nil {
+						break
+					}
+					var child *DumpedEntry
+					child, err = m.decodeEntry(dec, e.Attr.Inode, cs, parents, refs, kv, showProgress)
+					if err != nil {
+						break
+					}
+					e.Entries[n.(string)] = &DumpedEntry{
+						Attr: &DumpedAttr{
+							Inode: child.Attr.Inode,
+							Type:  child.Attr.Type,
+						},
+					}
+				}
+				if err == nil {
+					var t json.Token
+					t, err = dec.Token()
+					if err == nil && t != json.Delim('}') {
+						err = fmt.Errorf("unexpected %v", t)
+					}
+				}
+			}
+		case "symlink":
+			err = dec.Decode(&e.Symlink)
+		case "xattrs":
+			err = dec.Decode(&e.Xattrs)
 		}
-		m.Lock()
-		if inode > 1 && inode != TrashInode {
-			cs.UsedSpace += align4K(attr.Length)
-			cs.UsedInodes += 1
+		if err != nil {
+			return nil, fmt.Errorf("decode %v: %s", name, err)
 		}
-		if inode < TrashInode {
-			if cs.NextInode <= int64(inode) {
-				cs.NextInode = int64(inode) + 1
-			}
-		} else {
-			if cs.NextTrash < int64(inode)-TrashInode {
-				cs.NextTrash = int64(inode) - TrashInode
-			}
-		}
-		m.Unlock()
+	}
+	if len(e.Parents) == 1 {
+		_ = m.loadEntry(&e, kv)
+		showProgress(1)
+	}
+	_, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
 
-		for _, x := range e.Xattrs {
-			tx.set(m.xattrKey(inode, x.Name), []byte(unescape(x.Value)))
-		}
-		if numParents > 1 {
-			for _, parent := range e.Parents {
-				tx.incrBy(m.parentKey(inode, parent), 1)
-			}
-		}
-		tx.set(m.inodeKey(inode), m.marshal(attr))
-		return nil
-	})
+type chunkKey struct {
+	id   uint64
+	size uint32
 }
 
 func (m *kvMeta) LoadMeta(r io.Reader) error {
@@ -2597,81 +2712,101 @@ func (m *kvMeta) LoadMeta(r io.Reader) error {
 		return fmt.Errorf("Database %s is not empty", m.Name())
 	}
 
-	logger.Infoln("Reading file ...")
-	dec := json.NewDecoder(r)
 	dm := &DumpedMeta{}
-	if err := dec.Decode(dm); err != nil {
-		return err
-	}
-	format, err := json.MarshalIndent(dm.Setting, "", "")
-	if err != nil {
-		return err
-	}
-
-	progress := utils.NewProgress(false, false)
-	bar := progress.AddCountBar("Collected entries", 1) // with root
-	showProgress := func(totalIncr, currentIncr int64) {
-		bar.IncrTotal(totalIncr)
-		bar.IncrInt64(currentIncr)
-	}
-	dm.FSTree.Attr.Inode = 1
-	entries := make(map[Ino]*DumpedEntry)
-	if err = collectEntry(dm.FSTree, entries, showProgress); err != nil {
-		return err
-	}
-	if dm.Trash != nil {
-		bar.IncrTotal(1)
-		if err = collectEntry(dm.Trash, entries, showProgress); err != nil {
-			return err
-		}
-	}
-	bar.Done()
-
 	counters := &DumpedCounters{
 		NextInode: 2,
 		NextChunk: 1,
 	}
-	refs := make(map[string]int64)
-	bar = progress.AddCountBar("Loaded entries", int64(len(entries)))
-	maxNum := 100
-	pool := make(chan struct{}, maxNum)
-	errCh := make(chan error, 100)
-	done := make(chan struct{}, 1)
-	var wg sync.WaitGroup
-	for _, entry := range entries {
-		select {
-		case err = <-errCh:
-			return err
-		default:
-		}
-		pool <- struct{}{}
-		wg.Add(1)
-		go func(entry *DumpedEntry) {
-			defer func() {
-				wg.Done()
-				bar.Increment()
-				<-pool
-			}()
-			if err = m.loadEntry(entry, counters, refs); err != nil {
-				errCh <- err
+	parents := make(map[Ino][]Ino)
+	refs := make(map[chunkKey]int64)
+	kv := make(chan *pair, 10000)
+	batch := 10000
+	if m.Name() == "etcd" {
+		batch = 128
+	}
+	var w sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		w.Add(1)
+		go func() {
+			defer w.Done()
+			var buffer []*pair
+			for p := range kv {
+				buffer = append(buffer, p)
+				if len(buffer) >= batch {
+					err := m.txn(func(tx kvTxn) error {
+						for _, p := range buffer {
+							tx.set(p.key, p.value)
+						}
+						return nil
+					})
+					if err != nil {
+						logger.Fatalf("write %d pairs: %s", len(buffer), err)
+					}
+					buffer = buffer[:0]
+				}
 			}
-		}(entry)
+			if len(buffer) > 0 {
+				err := m.txn(func(tx kvTxn) error {
+					for _, p := range buffer {
+						tx.set(p.key, p.value)
+					}
+					return nil
+				})
+				if err != nil {
+					logger.Fatalf("write %d pairs: %s", len(buffer), err)
+				}
+			}
+		}()
 	}
 
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
+	logger.Infoln("loading from file ...")
+	progress := utils.NewProgress(false, false)
+	bar := progress.AddCountBar("loaded", 1) // with root
+	showProgress := func(currentIncr int64) {
+		bar.IncrInt64(currentIncr)
+	}
 
-	select {
-	case err = <-errCh:
+	dec := json.NewDecoder(r)
+	if _, err := dec.Token(); err != nil {
 		return err
-	case <-done:
 	}
+	for dec.More() {
+		name, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("parse name: %s", err)
+		}
+		switch name {
+		case "Setting":
+			err = dec.Decode(&dm.Setting)
+		case "Counters":
+			err = dec.Decode(&dm.Counters)
+			if err == nil {
+				bar.SetTotal(dm.Counters.UsedInodes)
+			}
+		case "Sustained":
+			err = dec.Decode(&dm.Sustained)
+		case "DelFiles":
+			err = dec.Decode(&dm.DelFiles)
+		case "FSTree":
+			_, err = m.decodeEntry(dec, 1, counters, parents, refs, kv, showProgress)
+		case "Trash":
+			_, err = m.decodeEntry(dec, 1, counters, parents, refs, kv, showProgress)
+		}
+		if err != nil {
+			return fmt.Errorf("load %v: %s", name, err)
+		}
+	}
+	_, _ = dec.Token() // }
+	close(kv)
+	w.Wait()
 	progress.Done()
+
+	format, err := json.MarshalIndent(dm.Setting, "", "")
+	if err != nil {
+		return err
+	}
 	logger.Infof("Dumped counters: %+v", *dm.Counters)
 	logger.Infof("Loaded counters: %+v", *counters)
-
 	return m.txn(func(tx kvTxn) error {
 		tx.set(m.fmtKey("setting"), format)
 		tx.set(m.counterKey(usedSpace), packCounter(counters.UsedSpace))
@@ -2683,9 +2818,29 @@ func (m *kvMeta) LoadMeta(r io.Reader) error {
 		for _, d := range dm.DelFiles {
 			tx.set(m.delfileKey(d.Inode, d.Length), m.packInt64(d.Expire))
 		}
+		// update parents for hardlinks
+		st := make(map[Ino]int64)
+		for i, ps := range parents {
+			if len(ps) > 1 {
+				a := tx.get(m.inodeKey(i))
+				// reset nlink and parent
+				binary.BigEndian.PutUint32(a[47:51], uint32(len(ps))) // nlink
+				binary.BigEndian.PutUint64(a[63:71], 0)
+				tx.set(m.inodeKey(i), a)
+				for k := range st {
+					delete(st, k)
+				}
+				for _, p := range ps {
+					st[p] = st[p] + 1
+				}
+				for p, c := range st {
+					tx.set(m.parentKey(i, p), packCounter(c))
+				}
+			}
+		}
 		for k, v := range refs {
 			if v > 1 {
-				tx.set([]byte(k), packCounter(v-1))
+				tx.set(m.chunkKey(Ino(k.id), k.size), packCounter(v-1))
 			}
 		}
 		return nil
