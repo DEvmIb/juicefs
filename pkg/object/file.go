@@ -22,13 +22,13 @@ import (
 	"io"
 	"io/fs"
 	"io/ioutil"
-	"math/rand"
+	//"math/rand"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
+	//"strconv"
 	"strings"
 	"time"
 )
@@ -143,20 +143,20 @@ func (d *filestore) Put(key string, in io.Reader) error {
 		return os.MkdirAll(p, os.FileMode(0755))
 	}
 
-	tmp := filepath.Join(filepath.Dir(p), "."+filepath.Base(p)+".tmp"+strconv.Itoa(rand.Int()))
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	//tmp := filepath.Join(filepath.Dir(p), "."+filepath.Base(p)+".tmp"+strconv.Itoa(rand.Int()))
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil && os.IsNotExist(err) {
 		if err := os.MkdirAll(filepath.Dir(p), os.FileMode(0755)); err != nil {
 			return err
 		}
-		f, err = os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err = os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	}
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if err != nil {
-			_ = os.Remove(tmp)
+			_ = os.Remove(p)
 		}
 	}()
 
@@ -175,7 +175,7 @@ func (d *filestore) Put(key string, in io.Reader) error {
 	if err != nil {
 		return err
 	}
-	err = os.Rename(tmp, p)
+	//err = os.Rename(tmp, p)
 	return err
 }
 
