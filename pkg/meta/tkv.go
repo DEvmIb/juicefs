@@ -61,7 +61,7 @@ type tkvClient interface {
 }
 
 type kvMeta struct {
-	baseMeta
+	*baseMeta
 	client tkvClient
 	snap   map[Ino]*DumpedEntry
 }
@@ -84,7 +84,7 @@ func newKVMeta(driver, addr string, conf *Config) (Meta, error) {
 	// TODO: ping server and check latency > Millisecond
 	// logger.Warnf("The latency to database is too high: %s", time.Since(start))
 	m := &kvMeta{
-		baseMeta: newBaseMeta(conf),
+		baseMeta: newBaseMeta(addr, conf),
 		client:   client,
 	}
 	m.en = m
@@ -622,12 +622,6 @@ func (m *kvMeta) ListSessions() ([]*Session, error) {
 }
 
 func (m *kvMeta) shouldRetry(err error) bool {
-	if err == nil {
-		return false
-	}
-	if _, ok := err.(syscall.Errno); ok {
-		return false
-	}
 	return m.client.shouldRetry(err)
 }
 
@@ -636,26 +630,30 @@ func (m *kvMeta) txn(f func(tx kvTxn) error, inodes ...Ino) error {
 		return syscall.EROFS
 	}
 	start := time.Now()
-	defer func() { txDist.Observe(time.Since(start).Seconds()) }()
+	defer func() { m.txDist.Observe(time.Since(start).Seconds()) }()
 	if len(inodes) > 0 {
-		m.txLock(int(inodes[0]))
-		defer m.txUnlock(int(inodes[0]))
+		m.txLock(uint(inodes[0]))
+		defer m.txUnlock(uint(inodes[0]))
 	}
-	var err error
+	var lastErr error
 	for i := 0; i < 50; i++ {
-		if err = m.client.txn(f); m.shouldRetry(err) {
-			txRestart.Add(1)
-			logger.Debugf("Transaction failed, restart it (tried %d): %s", i+1, err)
-			time.Sleep(time.Millisecond * time.Duration(rand.Int()%((i+1)*(i+1))))
-			continue
-		}
+		err := m.client.txn(f)
 		if eno, ok := err.(syscall.Errno); ok && eno == 0 {
 			err = nil
 		}
+		if err != nil && m.shouldRetry(err) {
+			m.txRestart.Add(1)
+			logger.Debugf("Transaction failed, restart it (tried %d): %s", i+1, err)
+			lastErr = err
+			time.Sleep(time.Millisecond * time.Duration(rand.Int()%((i+1)*(i+1))))
+			continue
+		} else if err == nil && i > 1 {
+			logger.Warnf("Transaction succeeded after %d tries (%s), inodes: %v, error: %s", i+1, time.Since(start), inodes, lastErr)
+		}
 		return err
 	}
-	logger.Warnf("Already tried 50 times, returning: %s", err)
-	return err
+	logger.Warnf("Already tried 50 times, returning: %s", lastErr)
+	return lastErr
 }
 
 func (m *kvMeta) setValue(key, value []byte) error {
@@ -738,7 +736,7 @@ func (m *kvMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 }
 
 func (m *kvMeta) SetAttr(ctx Context, inode Ino, set uint16, sugidclearmode uint8, attr *Attr) syscall.Errno {
-	defer timeit(time.Now())
+	defer m.timeit(time.Now())
 	inode = m.checkRoot(inode)
 	defer func() { m.of.InvalidateChunk(inode, 0xFFFFFFFE) }()
 	return errno(m.txn(func(tx kvTxn) error {
@@ -809,7 +807,7 @@ func (m *kvMeta) SetAttr(ctx Context, inode Ino, set uint16, sugidclearmode uint
 }
 
 func (m *kvMeta) Truncate(ctx Context, inode Ino, flags uint8, length uint64, attr *Attr) syscall.Errno {
-	defer timeit(time.Now())
+	defer m.timeit(time.Now())
 	f := m.of.find(inode)
 	if f != nil {
 		f.Lock()
@@ -890,7 +888,7 @@ func (m *kvMeta) Fallocate(ctx Context, inode Ino, mode uint8, off uint64, size 
 	if size == 0 {
 		return syscall.EINVAL
 	}
-	defer timeit(time.Now())
+	defer m.timeit(time.Now())
 	f := m.of.find(inode)
 	if f != nil {
 		f.Lock()
@@ -1642,7 +1640,7 @@ func (m *kvMeta) Read(ctx Context, inode Ino, indx uint32, chunks *[]Slice) sysc
 		*chunks = cs
 		return 0
 	}
-	defer timeit(time.Now())
+	defer m.timeit(time.Now())
 	val, err := m.get(m.chunkKey(inode, indx))
 	if err != nil {
 		return errno(err)
@@ -1660,7 +1658,7 @@ func (m *kvMeta) Read(ctx Context, inode Ino, indx uint32, chunks *[]Slice) sysc
 }
 
 func (m *kvMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice) syscall.Errno {
-	defer timeit(time.Now())
+	defer m.timeit(time.Now())
 	f := m.of.find(inode)
 	if f != nil {
 		f.Lock()
@@ -1707,7 +1705,7 @@ func (m *kvMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Sl
 }
 
 func (m *kvMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied *uint64) syscall.Errno {
-	defer timeit(time.Now())
+	defer m.timeit(time.Now())
 	var newSpace int64
 	f := m.of.find(fout)
 	if f != nil {
@@ -2020,7 +2018,9 @@ func (m *kvMeta) compactChunk(inode Ino, indx uint32, force bool) {
 	trash := m.toTrash(0)
 	if trash {
 		for _, s := range ss {
-			dsbuf = append(dsbuf, m.encodeDelayedSlice(s.chunkid, s.size)...)
+			if s.chunkid > 0 {
+				dsbuf = append(dsbuf, m.encodeDelayedSlice(s.chunkid, s.size)...)
+			}
 		}
 	}
 	err = m.txn(func(tx kvTxn) error {
@@ -2035,7 +2035,9 @@ func (m *kvMeta) compactChunk(inode Ino, indx uint32, force bool) {
 		// create the key to tracking it
 		tx.set(m.sliceKey(chunkid, size), make([]byte, 8))
 		if trash {
-			tx.set(m.delSliceKey(time.Now().Unix(), chunkid), dsbuf)
+			if len(dsbuf) > 0 {
+				tx.set(m.delSliceKey(time.Now().Unix(), chunkid), dsbuf)
+			}
 		} else {
 			for _, s := range ss {
 				if s.chunkid > 0 {
@@ -2171,7 +2173,7 @@ func (m *kvMeta) ListSlices(ctx Context, slices map[Ino][]Slice, delete bool, sh
 }
 
 func (m *kvMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) syscall.Errno {
-	defer timeit(time.Now())
+	defer m.timeit(time.Now())
 	inode = m.checkRoot(inode)
 	buf, err := m.get(m.xattrKey(inode, name))
 	if err != nil {
@@ -2185,7 +2187,7 @@ func (m *kvMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) sy
 }
 
 func (m *kvMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno {
-	defer timeit(time.Now())
+	defer m.timeit(time.Now())
 	inode = m.checkRoot(inode)
 	keys, err := m.scanKeys(m.xattrKey(inode, ""))
 	if err != nil {
@@ -2247,7 +2249,7 @@ func (m *kvMeta) dumpEntry(inode Ino, e *DumpedEntry) error {
 		if a == nil && e.Attr != nil {
 			attr.Typ = typeFromString(e.Attr.Type)
 		}
-		e.Attr = dumpAttr(attr) // TODO: reduce memory allocation
+		dumpAttr(attr, e.Attr)
 		e.Attr.Inode = inode
 
 		vals := tx.scanValues(m.xattrKey(inode, ""), -1, nil)
@@ -2409,7 +2411,8 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino) (err error) {
 				case 'I':
 					attr := &Attr{Nlink: 1}
 					m.parseAttr(value, attr)
-					e.Attr = dumpAttr(attr)
+					e.Attr = &DumpedAttr{}
+					dumpAttr(attr, e.Attr)
 					e.Attr.Inode = ino
 				case 'C':
 					indx := binary.BigEndian.Uint32(key[10:])
@@ -2451,7 +2454,12 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino) (err error) {
 		tree = m.snap[root]
 		trash = m.snap[TrashInode]
 	} else {
-		tree = &DumpedEntry{}
+		tree = &DumpedEntry{
+			Attr: &DumpedAttr{
+				Inode: root,
+				Type:  "directory",
+			},
+		}
 		if err = m.dumpEntry(root, tree); err != nil {
 			return err
 		}
@@ -2518,6 +2526,10 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino) (err error) {
 		dm.Setting.SecretKey = "removed"
 		logger.Warnf("Secret key is removed for the sake of safety")
 	}
+	if dm.Setting.SessionToken != "" {
+		dm.Setting.SessionToken = "removed"
+		logger.Warnf("Session token is removed for the sake of safety")
+	}
 	bw, err := dm.writeJsonWithOutTree(w)
 	if err != nil {
 		return err
@@ -2559,10 +2571,9 @@ type pair struct {
 	value []byte
 }
 
-func (m *kvMeta) loadEntry(e *DumpedEntry, kv chan *pair) error {
+func (m *kvMeta) loadEntry(e *DumpedEntry, kv chan *pair) {
 	inode := e.Attr.Inode
 	attr := loadAttr(e.Attr)
-	attr.Nlink = 1
 	attr.Parent = e.Parents[0]
 	if attr.Typ == TypeFile {
 		attr.Length = e.Attr.Length
@@ -2578,14 +2589,9 @@ func (m *kvMeta) loadEntry(e *DumpedEntry, kv chan *pair) error {
 		}
 	} else if attr.Typ == TypeDirectory {
 		attr.Length = 4 << 10
-		nlink := uint32(2)
 		for name, c := range e.Entries {
 			kv <- &pair{m.entryKey(inode, string(unescape(name))), m.packEntry(typeFromString(c.Attr.Type), c.Attr.Inode)}
-			if c.Attr.Type == "directory" {
-				nlink++
-			}
 		}
-		attr.Nlink = nlink
 	} else if attr.Typ == TypeSymlink {
 		symL := unescape(e.Symlink)
 		attr.Length = uint64(len(symL))
@@ -2595,108 +2601,6 @@ func (m *kvMeta) loadEntry(e *DumpedEntry, kv chan *pair) error {
 		kv <- &pair{m.xattrKey(inode, x.Name), []byte(unescape(x.Value))}
 	}
 	kv <- &pair{m.inodeKey(inode), m.marshal(attr)}
-	return nil
-}
-
-func (m *kvMeta) decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[Ino][]Ino,
-	refs map[chunkKey]int64, kv chan *pair, showProgress func(int64)) (*DumpedEntry, error) {
-	if _, err := dec.Token(); err != nil {
-		return nil, err
-	}
-	var e = DumpedEntry{}
-	for dec.More() {
-		name, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		switch name {
-		case "attr":
-			err = dec.Decode(&e.Attr)
-			if err == nil {
-				inode := e.Attr.Inode
-				e.Parents = append(parents[inode], parent)
-				parents[inode] = e.Parents
-				if len(e.Parents) == 1 {
-					if inode > 1 && inode != TrashInode {
-						cs.UsedSpace += align4K(e.Attr.Length)
-						cs.UsedInodes += 1
-					}
-					if inode < TrashInode {
-						if cs.NextInode <= int64(inode) {
-							cs.NextInode = int64(inode) + 1
-						}
-					} else {
-						if cs.NextTrash < int64(inode)-TrashInode {
-							cs.NextTrash = int64(inode) - TrashInode
-						}
-					}
-				}
-			}
-		case "chunks":
-			err = dec.Decode(&e.Chunks)
-			if err == nil && len(e.Parents) == 1 {
-				for _, c := range e.Chunks {
-					for _, s := range c.Slices {
-						refs[chunkKey{s.Chunkid, s.Size}]++
-						if cs.NextChunk <= int64(s.Chunkid) {
-							cs.NextChunk = int64(s.Chunkid) + 1
-						}
-					}
-				}
-			}
-		case "entries":
-			e.Entries = make(map[string]*DumpedEntry)
-			_, err = dec.Token()
-			if err == nil {
-				for dec.More() {
-					var n json.Token
-					n, err = dec.Token()
-					if err != nil {
-						break
-					}
-					var child *DumpedEntry
-					child, err = m.decodeEntry(dec, e.Attr.Inode, cs, parents, refs, kv, showProgress)
-					if err != nil {
-						break
-					}
-					e.Entries[n.(string)] = &DumpedEntry{
-						Attr: &DumpedAttr{
-							Inode: child.Attr.Inode,
-							Type:  child.Attr.Type,
-						},
-					}
-				}
-				if err == nil {
-					var t json.Token
-					t, err = dec.Token()
-					if err == nil && t != json.Delim('}') {
-						err = fmt.Errorf("unexpected %v", t)
-					}
-				}
-			}
-		case "symlink":
-			err = dec.Decode(&e.Symlink)
-		case "xattrs":
-			err = dec.Decode(&e.Xattrs)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("decode %v: %s", name, err)
-		}
-	}
-	if len(e.Parents) == 1 {
-		_ = m.loadEntry(&e, kv)
-		showProgress(1)
-	}
-	_, err := dec.Token()
-	if err != nil {
-		return nil, err
-	}
-	return &e, nil
-}
-
-type chunkKey struct {
-	id   uint64
-	size uint32
 }
 
 func (m *kvMeta) LoadMeta(r io.Reader) error {
@@ -2709,26 +2613,19 @@ func (m *kvMeta) LoadMeta(r io.Reader) error {
 		return err
 	}
 	if exist {
-		return fmt.Errorf("Database %s is not empty", m.Name())
+		return fmt.Errorf("Database %s://%s is not empty", m.Name(), m.addr)
 	}
 
-	dm := &DumpedMeta{}
-	counters := &DumpedCounters{
-		NextInode: 2,
-		NextChunk: 1,
-	}
-	parents := make(map[Ino][]Ino)
-	refs := make(map[chunkKey]int64)
 	kv := make(chan *pair, 10000)
 	batch := 10000
 	if m.Name() == "etcd" {
 		batch = 128
 	}
-	var w sync.WaitGroup
+	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
-		w.Add(1)
+		wg.Add(1)
 		go func() {
-			defer w.Done()
+			defer wg.Done()
 			var buffer []*pair
 			for p := range kv {
 				buffer = append(buffer, p)
@@ -2759,67 +2656,32 @@ func (m *kvMeta) LoadMeta(r io.Reader) error {
 		}()
 	}
 
-	logger.Infoln("loading from file ...")
-	progress := utils.NewProgress(false, false)
-	bar := progress.AddCountBar("loaded", 1) // with root
-	showProgress := func(currentIncr int64) {
-		bar.IncrInt64(currentIncr)
-	}
-
-	dec := json.NewDecoder(r)
-	if _, err := dec.Token(); err != nil {
-		return err
-	}
-	for dec.More() {
-		name, err := dec.Token()
-		if err != nil {
-			return fmt.Errorf("parse name: %s", err)
-		}
-		switch name {
-		case "Setting":
-			err = dec.Decode(&dm.Setting)
-		case "Counters":
-			err = dec.Decode(&dm.Counters)
-			if err == nil {
-				bar.SetTotal(dm.Counters.UsedInodes)
-			}
-		case "Sustained":
-			err = dec.Decode(&dm.Sustained)
-		case "DelFiles":
-			err = dec.Decode(&dm.DelFiles)
-		case "FSTree":
-			_, err = m.decodeEntry(dec, 1, counters, parents, refs, kv, showProgress)
-		case "Trash":
-			_, err = m.decodeEntry(dec, 1, counters, parents, refs, kv, showProgress)
-		}
-		if err != nil {
-			return fmt.Errorf("load %v: %s", name, err)
-		}
-	}
-	_, _ = dec.Token() // }
-	close(kv)
-	w.Wait()
-	progress.Done()
-
-	format, err := json.MarshalIndent(dm.Setting, "", "")
+	dm, counters, parents, refs, err := loadEntries(r, func(e *DumpedEntry) { m.loadEntry(e, kv) }, nil)
 	if err != nil {
 		return err
 	}
-	logger.Infof("Dumped counters: %+v", *dm.Counters)
-	logger.Infof("Loaded counters: %+v", *counters)
-	return m.txn(func(tx kvTxn) error {
-		tx.set(m.fmtKey("setting"), format)
-		tx.set(m.counterKey(usedSpace), packCounter(counters.UsedSpace))
-		tx.set(m.counterKey(totalInodes), packCounter(counters.UsedInodes))
-		tx.set(m.counterKey("nextInode"), packCounter(counters.NextInode))
-		tx.set(m.counterKey("nextChunk"), packCounter(counters.NextChunk))
-		tx.set(m.counterKey("nextSession"), packCounter(counters.NextSession))
-		tx.set(m.counterKey("nextTrash"), packCounter(counters.NextTrash))
-		for _, d := range dm.DelFiles {
-			tx.set(m.delfileKey(d.Inode, d.Length), m.packInt64(d.Expire))
+	format, _ := json.MarshalIndent(dm.Setting, "", "")
+	kv <- &pair{m.fmtKey("setting"), format}
+	kv <- &pair{m.counterKey(usedSpace), packCounter(counters.UsedSpace)}
+	kv <- &pair{m.counterKey(totalInodes), packCounter(counters.UsedInodes)}
+	kv <- &pair{m.counterKey("nextInode"), packCounter(counters.NextInode)}
+	kv <- &pair{m.counterKey("nextChunk"), packCounter(counters.NextChunk)}
+	kv <- &pair{m.counterKey("nextSession"), packCounter(counters.NextSession)}
+	kv <- &pair{m.counterKey("nextTrash"), packCounter(counters.NextTrash)}
+	for _, d := range dm.DelFiles {
+		kv <- &pair{m.delfileKey(d.Inode, d.Length), m.packInt64(d.Expire)}
+	}
+	for k, v := range refs {
+		if v > 1 {
+			kv <- &pair{m.sliceKey(k.id, k.size), packCounter(v - 1)}
 		}
-		// update parents for hardlinks
-		st := make(map[Ino]int64)
+	}
+	close(kv)
+	wg.Wait()
+
+	// update nlinks and parents for hardlinks
+	st := make(map[Ino]int64)
+	return m.txn(func(tx kvTxn) error {
 		for i, ps := range parents {
 			if len(ps) > 1 {
 				a := tx.get(m.inodeKey(i))
@@ -2836,11 +2698,6 @@ func (m *kvMeta) LoadMeta(r io.Reader) error {
 				for p, c := range st {
 					tx.set(m.parentKey(i, p), packCounter(c))
 				}
-			}
-		}
-		for k, v := range refs {
-			if v > 1 {
-				tx.set(m.chunkKey(Ino(k.id), k.size), packCounter(v-1))
 			}
 		}
 		return nil

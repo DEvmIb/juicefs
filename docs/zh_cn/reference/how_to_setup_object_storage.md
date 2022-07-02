@@ -48,6 +48,30 @@ $ juicefs format --storage s3 \
 
 公有云通常允许用户创建 IAM（Identity and Access Management）角色，例如：[AWS IAM 角色](https://docs.aws.amazon.com/zh_cn/IAM/latest/UserGuide/id_roles.html) 或 [阿里云 RAM 角色](https://help.aliyun.com/document_detail/93689.html)，可将角色分配给 VM 实例。如果云服务器实例已经拥有读写对象存储的权限，则无需再指定 `--access-key` 和 `--secret-key`。
 
+## 使用临时访问凭证
+
+永久访问凭证一般有两个部分，accessKey，secretKey，而临时访问凭证一般包括 3 个部分，accessKey，secretKey 与 token，并且临时访问凭证具有过期时间，一般在几分钟到几个小时之间。
+
+### 如何获取临时凭证
+
+不同云厂商的获取方式不同，一般是需要以具有相应权限用户的 accessKey，secretKey 以及代表临时访问凭证的权限边界的 ARN 作为参数请求访问云服务厂商的 STS 服务器来获取临时访问凭证。这个过程一般可以由云厂商提供的 SDK 简化操作。比如 AWS S3 获取临时凭证方式可以参考这个[链接](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp_request.html)，阿里云 OSS 获取临时凭证方式可以参考这个[链接](https://help.aliyun.com/document_detail/100624.html)。
+
+### 如何使用临时访问凭证设置对象存储
+
+使用临时凭证的方式与使用永久凭证差异不大，在文件系统 `format` 时，将临时凭证的 accessKey， secretKey， token 分别通过 --access-key，--secret-key，--session-token 设置值即可。 例如：
+
+```bash
+$ juicefs format --storage oss --access-key xxxx --secret-key xxxx --session-token xxxx --bucket https://bucketName.oss-cn-hangzhou.aliyuncs.com redis://localhost:6379/1 test1
+```
+
+由于临时凭证很快就会过期，所以关键在于在 `format` 文件系统后，如何在临时凭证过期前更新 juicefs 正在使用的临时凭证。一次凭证更新过程分为两步:
+
+1. 在临时凭证过期前，申请好新的临时凭证
+2. 无需停止正在运行的 juicefs ，直接使用 `juicefs config Meta-URL --access-key xxxx  --secret-key xxxx --session-token xxxx` 命令热更新访问凭证
+
+新挂载的客户端会直接使用新的凭证，已经在运行的所有客户端也会在一分钟内更新自己的凭证。整个更新过程不会影响正在运行的业务。由于临时凭证过期时间较短，所以以上步骤需要**长期循环执行**才能保证 juicefs 服务可以正常访问到对象存储。
+
+
 ## 内网和外网 Endpoint
 
 通常情况下，对象存储服务提供统一的 URL 进行访问，但云平台会同时提供内网和外网通信线路，比如满足条件的同平台云服务会自动解析通过内网线路访问对象存储，这样不但时延更低，而且内网通信产生的流量是免费的。
@@ -221,7 +245,7 @@ $ juicefs format \
 
 使用 Azure Blob 存储作为 JuiceFS 的数据存储，请先 [查看文档](https://docs.microsoft.com/zh-cn/azure/storage/common/storage-account-keys-manage) 了解如何查看存储帐户的名称和密钥，它们分别对应 `--access-key` 和 `--secret-key` 选项的值。
 
-`--bucket` 选项的设置格式为 `https://<container>.<endpoint>`，请将其中的 `<container>` 替换为实际的 Blob 容器的名称，将 `<endpoint>` 替换为 `blob.core.windows.net`（Azure 全球）或 `blob.core.chinacloudapi.cn`（Azure 中国）。例如：
+`--bucket` 选项的设置格式为 `https://<container>.<endpoint>`，请将其中的 `<container>` 替换为实际的 Blob 容器的名称，将 `<endpoint>` 替换为 `core.windows.net`（Azure 全球）或 `core.chinacloudapi.cn`（Azure 中国）。例如：
 
 ```bash
 juicefs format \
@@ -576,12 +600,12 @@ $ juicefs format \
 
 使用天翼云 OOS 作为 JuiceFS 数据存储，请先参照 [这篇文档](https://www.ctyun.cn/help2/10000101/10473683) 了解如何创建 `Access key` 和 `Secret key`。
 
-`--bucket` 选项的格式为 `https://<bucket>.oss-<region>.ctyunapi.cn`，请将 `<region>` 替换成你实际使用的存储区域，例如：成都的区域代码为 `sccd`。[点此查看](https://www.ctyun.cn/help2/10000101/10474062) 所有可用的区域代码。例如：
+`--bucket` 选项的格式为 `https://<bucket>.<endpoint>`，例如：
 
 ```bash
 $ juicefs format \
     --storage oos \
-    --bucket https://<bucket>.oss-<region>.ctyunapi.cn \
+    --bucket https://<bucket>.<endpoint> \
     ... \
     myjfs
 ```
@@ -824,6 +848,11 @@ $ juicefs format \
     ... \
     myjfs
 ```
+
+:::note 注意
+不要使用同一个集群来存储元数据和数据，因为 JuiceFS 是使用不同的协议来存储元数据（支持事务的TxnKV) 和数据 (不支持事务的 RawKV)，TxnKV 的对象名会被编码后存储，
+即使添加了不同的前缀也可能导致它们的名字冲突。另外，建议启用 [Titan](https://tikv.org/docs/5.1/deploy/configure/titan/) 来提升存储数据的集群的性能。
+:::
 
 ### 设置 TLS
 如果需要开启 TLS，可以通过在 Bucket-URL 后以添加 query 参数的形式设置 TLS 的配置项，目前支持的配置项：

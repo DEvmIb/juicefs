@@ -12,7 +12,6 @@ slug: /command_reference
 在终端输入 `juicefs` 并执行，你就会看到所有可用的命令。另外，你可以在每个命令后面添加 `-h/--help` 标记获得该命令的详细帮助信息。
 
 ```bash
-$ juicefs -h
 NAME:
    juicefs - A POSIX file system built on Redis and object storage.
 
@@ -20,7 +19,7 @@ USAGE:
    juicefs [global options] command [command options] [arguments...]
 
 VERSION:
-   1.0.0-dev+2022-05-25.b0034f37
+   1.0.0-rc2+2022-06-24.fc6b1206
 
 COMMANDS:
    ADMIN:
@@ -31,6 +30,7 @@ COMMANDS:
      fsck     Check consistency of a volume
      dump     Dump metadata into a JSON file
      load     Load metadata from a previously dumped JSON file
+     version  Show version
    INSPECTOR:
      status   Show status of a volume
      stats    Show real time performance statistics of JuiceFS
@@ -158,6 +158,9 @@ juicefs format [command options] META-URL NAME
 `--secret-key value`<br />
 对象存储的 Secret Key (也可通过环境变量 `SECRET_KEY` 设置)
 
+`--session-token value`<br />
+对象存储的 session token 
+
 `--encrypt-rsa-key value`<br />
 RSA 私钥的路径 (PEM)
 
@@ -254,7 +257,7 @@ consul注册中心地址(默认: "127.0.0.1:8500")
 后台异步上传对象 (默认: false)
 
 `--cache-dir value`<br />
-本地缓存目录路径；使用冒号隔离多个路径 (默认: `"$HOME/.juicefs/cache"` 或 `"/var/jfsCache"`)
+本地缓存目录路径；使用 `:`（Linux、macOS）或 `;`（Windows）隔离多个路径 (默认: `"$HOME/.juicefs/cache"` 或 `"/var/jfsCache"`)
 
 `--cache-size value`<br />
 缓存对象的总大小；单位为 MiB (默认: 102400)
@@ -342,7 +345,7 @@ juicefs gateway [command options] META-URL ADDRESS
 后台异步上传对象 (默认: false)
 
 `--cache-dir value`<br />
-本地缓存目录路径；使用冒号隔离多个路径 (默认: `"$HOME/.juicefs/cache"` 或 `/var/jfsCache`)
+本地缓存目录路径；使用 `:`（Linux、macOS）或 `;`（Windows）隔离多个路径 (默认: `"$HOME/.juicefs/cache"` 或 `/var/jfsCache`)
 
 `--cache-size value`<br />
 缓存对象的总大小；单位为 MiB (默认: 102400)
@@ -442,7 +445,7 @@ juicefs webdav [command options] META-URL ADDRESS
 数据上传到对象存储的延迟时间,支持秒分时精度，对应格式分别为("s", "m", "h")，默认为 0 秒
 
 `--cache-dir value`<br />
-本地缓存目录路径；使用冒号隔离多个路径 (默认: `"$HOME/.juicefs/cache"` 或 `/var/jfsCache`)
+本地缓存目录路径；使用 `:`（Linux、macOS）或 `;`（Windows）隔离多个路径 (默认: `"$HOME/.juicefs/cache"` 或 `/var/jfsCache`)
 
 `--cache-size value`<br />
 缓存对象的总大小；单位为 MiB (默认: 102400)
@@ -882,6 +885,9 @@ juicefs config [command options] META-URL
 
 `--secret-key value`<br />
 对象存储的 Secret key
+
+`--session-token value`<br />
+对象存储的 session token
 
 `--trash-days value`<br />
 文件被自动清理前在回收站内保留的天数

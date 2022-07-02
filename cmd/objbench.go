@@ -49,7 +49,7 @@ Run basic benchmarks on the target object storage to test if it works as expecte
 
 Examples:
 # Run benchmarks on S3
-$ ACCESS_KEY=myAccessKey SECRET_KEY=mySecretKey juicefs objbench --storage s3 --bucket https://mybucket.s3.us-east-2.amazonaws.com -p 4
+$ ACCESS_KEY=myAccessKey SECRET_KEY=mySecretKey juicefs objbench --storage s3  https://mybucket.s3.us-east-2.amazonaws.com -p 6
 
 Details: https://juicefs.com/docs/community/performance_evaluation_guide#juicefs-objbench`,
 		Flags: []cli.Flag{
@@ -65,6 +65,10 @@ Details: https://juicefs.com/docs/community/performance_evaluation_guide#juicefs
 			&cli.StringFlag{
 				Name:  "secret-key",
 				Usage: "secret key for object storage (env SECRET_KEY)",
+			},
+			&cli.StringFlag{
+				Name:  "session-token",
+				Usage: "session token for object storage",
 			},
 			&cli.UintFlag{
 				Name:  "block-size",
@@ -114,14 +118,17 @@ func objbench(ctx *cli.Context) error {
 			logger.Fatalf("%s should not be set to zero", name)
 		}
 	}
-	ak, sk := ctx.String("access-key"), ctx.String("secret-key")
+	ak, sk, token := ctx.String("access-key"), ctx.String("secret-key"), ctx.String("session-token")
 	if ak == "" {
 		ak = os.Getenv("ACCESS_KEY")
 	}
 	if sk == "" {
 		sk = os.Getenv("SECRET_KEY")
 	}
-	blobOrigin, err := object.CreateStorage(strings.ToLower(ctx.String("storage")), ctx.Args().First(), ak, sk)
+	if token == "" {
+		token = os.Getenv("SESSION_TOKEN")
+	}
+	blobOrigin, err := object.CreateStorage(strings.ToLower(ctx.String("storage")), ctx.Args().First(), ak, sk, token)
 	if err != nil {
 		logger.Fatalf("create storage failed: %v", err)
 	}
@@ -152,7 +159,7 @@ func objbench(ctx *cli.Context) error {
 	if !ctx.IsSet("skip-functional-tests") {
 		functionalTesting(blob, &result, tty)
 	}
-	printResult(result, tty)
+	printResult(result, -1, tty)
 	fmt.Println("\nStart Performance Testing ...")
 	var pResult [][]string
 	pResult = append(pResult, []string{"ITEM", "VALUE", "COST"})
@@ -324,7 +331,7 @@ func objbench(ctx *cli.Context) error {
 	pResult[1], pResult[3] = pResult[3], pResult[1]
 	pResult[2], pResult[4] = pResult[4], pResult[2]
 	pResult[7], pResult[10] = pResult[10], pResult[7]
-	printResult(pResult, tty)
+	printResult(pResult, -1, tty)
 	return nil
 }
 

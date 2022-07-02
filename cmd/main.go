@@ -36,6 +36,8 @@ import (
 var logger = utils.GetLogger("juicefs")
 
 func Main(args []string) error {
+	// we have to call this because gspt removes all arguments
+	gspt.SetProcTitle(strings.Join(os.Args, " "))
 	cli.VersionFlag = &cli.BoolFlag{
 		Name: "version", Aliases: []string{"V"},
 		Usage: "print version only",
@@ -56,6 +58,7 @@ func Main(args []string) error {
 			cmdFsck(),
 			cmdDump(),
 			cmdLoad(),
+			cmdVersion(),
 			cmdStatus(),
 			cmdStats(),
 			cmdProfile(),
@@ -203,7 +206,7 @@ func reorderOptions(app *cli.App, args []string) []string {
 		option := args[i]
 		if ok, hasValue := isFlag(cmdFlags, option); ok {
 			newArgs = append(newArgs, option)
-			if hasValue {
+			if hasValue && len(args[i+1:]) > 0 {
 				i++
 				newArgs = append(newArgs, args[i])
 			}

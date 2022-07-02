@@ -16,7 +16,6 @@ import (
 	"github.com/juicedata/juicefs/pkg/fs"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/metric"
-	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/urfave/cli/v2"
 )
 
@@ -38,6 +37,7 @@ func createDir(jfs *fs.FileSystem, root string, d int, width int) error {
 }
 
 func createFile(jfs *fs.FileSystem, bar *utils.Bar, np int, root string, d int, width, files, bytes int) error {
+	m := jfs.Meta()
 	for i := 0; i < files; i++ {
 		fn := filepath.Join(root, fmt.Sprintf("file.mdtest.%d.%d", np, i))
 		f, err := jfs.Create(ctx, fn, 0644)
@@ -45,13 +45,18 @@ func createFile(jfs *fs.FileSystem, bar *utils.Bar, np int, root string, d int, 
 			return fmt.Errorf("create %s: %s", fn, err)
 		}
 		if bytes > 0 {
-			m := jfs.Meta()
-			var chunkid uint64
-			if st := m.NewChunk(ctx, &chunkid); st != 0 {
-				return fmt.Errorf("writechunk %s: %s", fn, st)
-			}
-			if st := m.Write(ctx, f.Inode(), 0, 0, meta.Slice{Chunkid: chunkid, Size: uint32(bytes), Len: uint32(bytes)}); st != 0 {
-				return fmt.Errorf("writeend %s: %s", fn, st)
+			for indx := 0; indx*meta.ChunkSize < bytes; indx++ {
+				var chunkid uint64
+				if st := m.NewChunk(ctx, &chunkid); st != 0 {
+					return fmt.Errorf("writechunk %s: %s", fn, st)
+				}
+				size := meta.ChunkSize
+				if bytes < (indx+1)*meta.ChunkSize {
+					size = bytes - indx*meta.ChunkSize
+				}
+				if st := m.Write(ctx, f.Inode(), uint32(indx), 0, meta.Slice{Chunkid: chunkid, Size: uint32(size), Len: uint32(size)}); st != 0 {
+					return fmt.Errorf("writeend %s: %s", fn, st)
+				}
 			}
 		}
 		f.Close(ctx)
@@ -175,7 +180,7 @@ $ juicefs mdtest redis://localhost /test1`,
 	}
 }
 
-func initForMdtest(c *cli.Context, mp string, metaUrl string) (meta.Meta, chunk.ChunkStore, *vfs.Config) {
+func initForMdtest(c *cli.Context, mp string, metaUrl string) *fs.FileSystem {
 	metaConf := getMetaConf(c, mp, c.Bool("read-only"))
 	m := meta.NewClient(metaUrl, metaConf)
 	format, err := m.Load(true)
@@ -214,18 +219,20 @@ func initForMdtest(c *cli.Context, mp string, metaUrl string) (meta.Meta, chunk.
 	if c.IsSet("consul") {
 		metric.RegisterToConsul(c.String("consul"), metricsAddr, conf.Meta.MountPoint)
 	}
-	return m, store, conf
+	jfs, err := fs.NewFileSystem(conf, m, store)
+	if err != nil {
+		logger.Fatalf("initialize failed: %s", err)
+	}
+	jfs.InitMetrics(registerer)
+	return jfs
 }
 
 func mdtest(c *cli.Context) error {
 	setup(c, 2)
 	metaUrl := c.Args().Get(0)
 	rootDir := c.Args().Get(1)
-	m, store, conf := initForMdtest(c, "mdtest", metaUrl)
-	jfs, err := fs.NewFileSystem(conf, m, store)
-	if err != nil {
-		logger.Fatalf("initialize failed: %s", err)
-	}
+	removePassword(metaUrl)
+	jfs := initForMdtest(c, "mdtest", metaUrl)
 	runTest(jfs, rootDir, c.Int("threads"), c.Int("dirs"), c.Int("depth"), c.Int("files"), c.Int("write"))
-	return m.CloseSession()
+	return jfs.Meta().CloseSession()
 }

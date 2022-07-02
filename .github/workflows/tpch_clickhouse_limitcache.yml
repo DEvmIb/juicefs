@@ -13,7 +13,7 @@ on:
     paths-ignore:
       - 'docs/**'
   schedule:
-    - cron:  '30 * * * *'
+    - cron:  '30 20 * * *'
 
   workflow_dispatch:
 
@@ -72,8 +72,8 @@ jobs:
       - name: Generate Data
         run: |
           cd /data/jfs/
-          git clone https://github.com/sanwan/actiondata.git
-          cd actiondata
+          git clone https://github.com/sanwan/chdata.git
+          cd chdata
           cat lineorder.tbl.gz* >lineorder.tbl.gz
           gzip -dk lineorder.tbl.gz
           git clone https://github.com/sanwan/actionfile.git
@@ -147,12 +147,11 @@ jobs:
       - name: Import Data
         run: |
           df -lh
-          cd /data/jfs/actiondata/
+          cd /data/jfs/chdata/
           clickhouse-client --query "INSERT INTO customer FORMAT CSV" < customer.tbl
           clickhouse-client --query "INSERT INTO part FORMAT CSV" < part.tbl
           clickhouse-client --query "INSERT INTO supplier FORMAT CSV" < supplier.tbl
           time clickhouse-client --query "INSERT INTO lineorder FORMAT CSV" < lineorder.tbl
-          sudo du -sh /data/jfs/
           df -lh
 
       - name: ClickHouse Test
@@ -254,7 +253,6 @@ jobs:
                                      ORDER BY
                                          year ASC,
                                          C_NATION ASC;"
-          sudo du -sh /data/jfs/
           df -lh
 
 

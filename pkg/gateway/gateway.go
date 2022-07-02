@@ -34,7 +34,6 @@ import (
 	"github.com/minio/minio-go/pkg/s3utils"
 	minio "github.com/minio/minio/cmd"
 
-	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/fs"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -55,11 +54,7 @@ type Config struct {
 	Mode        uint16
 }
 
-func NewJFSGateway(conf *vfs.Config, m meta.Meta, store chunk.ChunkStore, gConf *Config) (minio.ObjectLayer, error) {
-	jfs, err := fs.NewFileSystem(conf, m, store)
-	if err != nil {
-		return nil, fmt.Errorf("Initialize failed: %s", err)
-	}
+func NewJFSGateway(jfs *fs.FileSystem, conf *vfs.Config, gConf *Config) (minio.ObjectLayer, error) {
 	mctx = meta.NewContext(uint32(os.Getpid()), uint32(os.Getuid()), []uint32{uint32(os.Getgid())})
 	jfsObj := &jfsObjects{fs: jfs, conf: conf, listPool: minio.NewTreeWalkPool(time.Minute * 30), gConf: gConf}
 	go jfsObj.cleanup()
@@ -920,7 +915,8 @@ func (n *jfsObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 
 func (n *jfsObjects) cleanup() {
 	for t := range time.Tick(24 * time.Hour) {
-		var tmpDirs []string
+		// default bucket tmp dirs
+		tmpDirs := []string{".sys/tmp/", ".sys/uploads/"}
 		if n.gConf.MultiBucket {
 			buckets, err := n.ListBuckets(context.Background())
 			if err != nil {
@@ -931,9 +927,6 @@ func (n *jfsObjects) cleanup() {
 				tmpDirs = append(tmpDirs, fmt.Sprintf(".sys/%s/tmp", bucket.Name))
 				tmpDirs = append(tmpDirs, fmt.Sprintf(".sys/%s/uploads", bucket.Name))
 			}
-		} else {
-			tmpDirs = append(tmpDirs, ".sys/tmp/")
-			tmpDirs = append(tmpDirs, ".sys/uploads/")
 		}
 		for _, dir := range tmpDirs {
 			f, errno := n.fs.Open(mctx, dir, 0)
