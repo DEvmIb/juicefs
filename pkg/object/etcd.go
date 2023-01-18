@@ -111,7 +111,10 @@ func genNextKey(key string) string {
 	return string(next)
 }
 
-func (c *etcdClient) List(prefix, marker string, limit int64) ([]Object, error) {
+func (c *etcdClient) List(prefix, marker, delimiter string, limit int64) ([]Object, error) {
+	if delimiter != "" {
+		return nil, notSupportedDelimiter
+	}
 	if marker == "" {
 		marker = prefix
 	}
@@ -156,8 +159,8 @@ func buildTlsConfig(u *url.URL) (*tls.Config, error) {
 }
 
 func newEtcd(addr, user, passwd, token string) (ObjectStorage, error) {
-	if !strings.Contains(addr, "://") {
-		addr = "http://" + addr
+	if !strings.HasPrefix(addr, "etcd://") {
+		addr = "etcd://" + addr
 	}
 	u, err := url.Parse(addr)
 	if err != nil {

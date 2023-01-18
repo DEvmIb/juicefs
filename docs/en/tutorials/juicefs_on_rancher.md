@@ -1,11 +1,10 @@
 ---
-sidebar_label: Use JuiceFS on Rancher
+title: Use JuiceFS on Rancher
 sidebar_position: 2
 slug: /juicefs_on_rancher
 ---
-# Use JuiceFS on Rancher
 
-[Rancher](https://rancher.com/) is an enterprise-level Kubernetes cluster management system, which can be used to quickly complete the deployment of Kubernetes clusters on various cloud computing platforms.
+[Rancher](https://rancher.com) is an enterprise-level Kubernetes cluster management system, which can be used to quickly complete the deployment of Kubernetes clusters on various cloud computing platforms.
 
 Rancher provides a browser-based management interface, even users who are not experienced in Kubernetes can start to manage and use easily. It is preset with Helm-based application market by default, and various Kubernetes applications can be installed very easy under the graphical interface.
 
@@ -24,7 +23,7 @@ Here we choose to install Rancher on Docker, with the following requirements:
 Run the following command to install Rancher:
 
 ```shell
-$ sudo docker run --privileged -d --restart=unless-stopped -p 80:80 -p 443:443 rancher/rancher
+sudo docker run --privileged -d --restart=unless-stopped -p 80:80 -p 443:443 rancher/rancher
 ```
 
 After the container is created, Rancher's management interface can be opened by accessing the IP address of the host.
@@ -51,8 +50,8 @@ After the cluster is created, it will be displayed in Rancher's cluster list.
 
 In the cluster list, click to enter the Kubernetes cluster, click on the left navigation menu to expand `Apps & Marketplace` -> `Chart Repositories`, click the `Create` button to add JuiceFS CSI repository, fill in:
 
-- **Name**: juicefs
-- **Index URL**: https://juicedata.github.io/charts/
+- **Name**: `juicefs`
+- **Index URL**: `https://juicedata.github.io/charts/`
 
 ![](../images/rancher-new-repo.jpg)
 
@@ -76,7 +75,7 @@ The JuiceFS CSI Driver defaults to `kube-system`, and there is no need to set th
 
 ### Step 2: Adjust configuration parameters
 
-This page provides a YAML editor, you can adjust JuiceFS-related information according to your needs. Usually you only need to modify the `storageClasses` part, where the `backend` part is used to define the backend database and object storage of the file system. You can refer to [JuiceFS Quick Start Guide](../getting-started/for_local.md) to learn the detail. If you are using a pre-created file system, you only need to fill in the two items `metaurl` and `name`, for example:
+This page provides a YAML editor, you can adjust JuiceFS-related information according to your needs. Usually you only need to modify the `storageClasses` part, where the `backend` part is used to define the backend database and object storage of the file system. You can refer to [JuiceFS Quick Start Guide](../getting-started/README.md) to learn the detail. If you are using a pre-created file system, you only need to fill in the two items `metaurl` and `name`, for example:
 
 ```yaml
 ...

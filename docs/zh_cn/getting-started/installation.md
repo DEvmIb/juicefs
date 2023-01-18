@@ -1,14 +1,22 @@
 ---
-sidebar_label: 安装 & 升级
+title: 安装
 sidebar_position: 1
 slug: /installation
+pagination_prev: introduction/comparison/juicefs_vs_s3ql
+description: 本文介绍 JuiceFS 在 Linux、macOS 和 Windows 上的安装方法，包括一键安装、编译安装和容器化安装。
 ---
-
-# 安装与升级
 
 JuiceFS 有良好的跨平台能力，支持在几乎所有主流架构的各类操作系统上运行，包括且不限于 Linux、macOS、Windows 等。
 
 JuiceFS 客户端只有一个二进制文件，你可以下载预编译的版本直接解压使用，也可以用源代码手动编译。
+
+## 一键安装
+
+一键安装脚本适用于 Linux 和 macOS 系统，会根据你的硬件架构自动下载安装最新版 JuiceFS 客户端。
+
+```shell
+curl -sSL https://d.juicefs.com/install | sh -
+```
 
 ## 安装预编译客户端
 
@@ -92,7 +100,7 @@ JuiceFS 的 Windows 客户端也是一个独立的二进制程序，下载解压
 
 ### macOS 系统
 
-由于 macOS 默认不支持 FUSE 接口，需要先安装 [macFUSE](https://osxfuse.github.io/) 实现对 FUSE 的支持。
+由于 macOS 默认不支持 FUSE 接口，需要先安装 [macFUSE](https://osxfuse.github.io) 实现对 FUSE 的支持。
 
 :::tip 提示
 [macFUSE](https://github.com/osxfuse/osxfuse) 是一个开源的文件系统增强工具，它让 macOS 可以挂载第三方的文件系统，使得 JuiceFS 客户端可以将文件系统挂载到 macOS 系统中使用。
@@ -100,7 +108,7 @@ JuiceFS 的 Windows 客户端也是一个独立的二进制程序，下载解压
 
 #### Homebrew 安装
 
-如果你的系统安装了 [Homebrew](https://brew.sh/) 包管理器，可以执行以下命令安装 JuiceFS 客户端：
+如果你的系统安装了 [Homebrew](https://brew.sh) 包管理器，可以执行以下命令安装 JuiceFS 客户端：
 
 ```shell
 brew tap juicedata/homebrew-tap
@@ -157,7 +165,7 @@ CMD [ "juicefs" ]
 
 编译面向 Linux、macOS、BSD 等类 Unix 系统的客户端需要满足以下依赖：
 
-- [Go](https://golang.org) 1.17+
+- [Go](https://golang.org) 1.18+
 - GCC 5.4+
 
 1. 克隆源码
@@ -174,10 +182,10 @@ CMD [ "juicefs" ]
 
 3. 切换分支
 
-   源代码默认使用 `main` 分支，你可以切换到任何正式发布的版本，比如切换到 `v1.0.0-beta2` 版本：
+   源代码默认使用 `main` 分支，你可以切换到任何正式发布的版本，比如切换到 `v1.0.0` 版本：
 
    ```shell
-   git checkout v1.0.0-beta2
+   git checkout v1.0.0
    ```
 
    :::caution 注意
@@ -194,9 +202,9 @@ CMD [ "juicefs" ]
 
 ### 在 Windows 下编译
 
-在 Windows 系统中编译 JuiceFS 客户端，需要安装 [Go](https://golang.org) 1.17+ 和 GCC 5.4+。
+在 Windows 系统中编译 JuiceFS 客户端，需要安装 [Go](https://golang.org) 1.18+ 和 GCC 5.4+。
 
-由于 GCC 没有原生 Windows 客户端，因此需要使用第三方提供的版本，可以使用 [MinGW-w64](https://sourceforge.net/projects/mingw-w64/) 或 [Cygwin](https://www.cygwin.com/)，这里以 MinGW-w64 为例介绍。
+由于 GCC 没有原生 Windows 客户端，因此需要使用第三方提供的版本，可以使用 [MinGW-w64](https://sourceforge.net/projects/mingw-w64) 或 [Cygwin](https://www.cygwin.com)，这里以 MinGW-w64 为例介绍。
 
 下载 MinGW-w64 并将其内的 `bin` 目录添加到系统环境变量。
 
@@ -273,18 +281,6 @@ make juicefs.exe
    ```shell
    make juicefs.linux
    ```
-
-
-## 客户端升级
-
-JuiceFS 客户端只有一个二进制程序，升级新版只需用新版程序替换旧版程序即可。
-
-- **使用预编译客户端**：可以参照本文档中相应系统的安装方法，下载最新的客户端，覆盖旧版客户端即可。
-- **手动编译客户端**：可以拉取最新的源代码重新编译，覆盖旧版客户端即可。
-
-:::caution 注意
-对于使用旧版 JuiceFS 客户端已经挂载好的文件系统，需要先[卸载文件系统](for_distributed.md#6-卸载文件系统)，然后用新版 JuiceFS 客户端重新挂载。
-:::
 
 ## 卸载客户端
 

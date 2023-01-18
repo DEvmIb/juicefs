@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,38 +129,42 @@ func align4K(length uint64) int64 {
 	return int64((((length - 1) >> 12) + 1) << 12)
 }
 
-func lookupSubdir(m Meta, subdir string) (Ino, error) {
-	var root Ino = 1
-	for subdir != "" {
-		ps := strings.SplitN(subdir, "/", 2)
-		if ps[0] != "" {
-			var attr Attr
-			var inode Ino
-			r := m.Lookup(Background, root, ps[0], &inode, &attr)
-			if r == syscall.ENOENT {
-				r = m.Mkdir(Background, root, ps[0], 0777, 0, 0, &inode, &attr)
-			}
-			if r != 0 {
-				return 0, fmt.Errorf("lookup subdir %s: %s", ps[0], r)
-			}
-			if attr.Typ != TypeDirectory {
-				return 0, fmt.Errorf("%s is not a redirectory", ps[0])
-			}
-			root = inode
-		}
-		if len(ps) == 1 {
-			break
-		}
-		subdir = ps[1]
-	}
-	return root, nil
+type plockRecord struct {
+	Type  uint32
+	Pid   uint32
+	Start uint64
+	End   uint64
 }
 
-type plockRecord struct {
-	ltype uint32
-	pid   uint32
-	start uint64
-	end   uint64
+type ownerKey struct {
+	Sid   uint64
+	Owner uint64
+}
+
+type PLockItem struct {
+	ownerKey
+	plockRecord
+}
+
+type FLockItem struct {
+	ownerKey
+	Type string
+}
+
+func parseOwnerKey(key string) (*ownerKey, error) {
+	pair := strings.Split(key, "_")
+	if len(pair) != 2 {
+		return nil, fmt.Errorf("invalid owner key: %s", key)
+	}
+	sid, err := strconv.ParseUint(pair[0], 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	owner, err := strconv.ParseUint(pair[1], 16, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &ownerKey{sid, owner}, nil
 }
 
 func loadLocks(d []byte) []plockRecord {
@@ -174,10 +179,10 @@ func loadLocks(d []byte) []plockRecord {
 func dumpLocks(ls []plockRecord) []byte {
 	wb := utils.NewBuffer(uint32(len(ls)) * 24)
 	for _, l := range ls {
-		wb.Put32(l.ltype)
-		wb.Put32(l.pid)
-		wb.Put64(l.start)
-		wb.Put64(l.end)
+		wb.Put32(l.Type)
+		wb.Put32(l.Pid)
+		wb.Put64(l.Start)
+		wb.Put64(l.End)
 	}
 	return wb.Bytes()
 }
@@ -185,47 +190,47 @@ func dumpLocks(ls []plockRecord) []byte {
 func updateLocks(ls []plockRecord, nl plockRecord) []plockRecord {
 	// ls is ordered by l.start without overlap
 	size := len(ls)
-	for i := 0; i < size && nl.start <= nl.end; i++ {
+	for i := 0; i < size && nl.Start <= nl.End; i++ {
 		l := ls[i]
-		if nl.start < l.start && nl.end >= l.start {
+		if nl.Start < l.Start && nl.End >= l.Start {
 			// split nl
 			ls = append(ls, nl)
-			ls[len(ls)-1].end = l.start - 1
-			nl.start = l.start
+			ls[len(ls)-1].End = l.Start - 1
+			nl.Start = l.Start
 		}
-		if nl.start > l.start && nl.start <= l.end {
+		if nl.Start > l.Start && nl.Start <= l.End {
 			// split l
-			l.end = nl.start - 1
+			l.End = nl.Start - 1
 			ls = append(ls, l)
-			ls[i].start = nl.start
+			ls[i].Start = nl.Start
 			l = ls[i]
 		}
-		if nl.start == l.start {
-			ls[i].ltype = nl.ltype // update l
-			ls[i].pid = nl.pid
-			if l.end > nl.end {
+		if nl.Start == l.Start {
+			ls[i].Type = nl.Type // update l
+			ls[i].Pid = nl.Pid
+			if l.End > nl.End {
 				// split l
-				ls[i].end = nl.end
-				l.start = nl.end + 1
+				ls[i].End = nl.End
+				l.Start = nl.End + 1
 				ls = append(ls, l)
 			}
-			nl.start = ls[i].end + 1
+			nl.Start = ls[i].End + 1
 		}
 	}
-	if nl.start <= nl.end {
+	if nl.Start <= nl.End {
 		ls = append(ls, nl)
 	}
-	sort.Slice(ls, func(i, j int) bool { return ls[i].start < ls[j].start })
+	sort.Slice(ls, func(i, j int) bool { return ls[i].Start < ls[j].Start })
 	for i := 0; i < len(ls); {
-		if ls[i].ltype == F_UNLCK || ls[i].start > ls[i].end {
+		if ls[i].Type == F_UNLCK || ls[i].Start > ls[i].End {
 			// remove empty one
 			copy(ls[i:], ls[i+1:])
 			ls = ls[:len(ls)-1]
 		} else {
-			if i+1 < len(ls) && ls[i].ltype == ls[i+1].ltype && ls[i].pid == ls[i+1].pid && ls[i].end+1 == ls[i+1].start {
+			if i+1 < len(ls) && ls[i].Type == ls[i+1].Type && ls[i].Pid == ls[i+1].Pid && ls[i].End+1 == ls[i+1].Start {
 				// combine continuous range
-				ls[i].end = ls[i+1].end
-				ls[i+1].start = ls[i+1].end + 1
+				ls[i].End = ls[i+1].End
+				ls[i+1].Start = ls[i+1].End + 1
 			}
 			i++
 		}
@@ -287,7 +292,7 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, count *uint64, concurrent ch
 			entries[i] = nil // release memory
 		}
 		wg.Wait()
-		if status != 0 {
+		if status != 0 || inode == TrashInode { // try only once for .trash
 			return status
 		}
 	}
@@ -295,7 +300,7 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, count *uint64, concurrent ch
 
 func (m *baseMeta) emptyEntry(ctx Context, parent Ino, name string, inode Ino, count *uint64, concurrent chan int) syscall.Errno {
 	st := m.emptyDir(ctx, inode, count, concurrent)
-	if st == 0 {
+	if st == 0 && !isTrash(inode) {
 		st = m.Rmdir(ctx, parent, name)
 		if st == syscall.ENOTEMPTY {
 			st = m.emptyEntry(ctx, parent, name, inode, count, concurrent)

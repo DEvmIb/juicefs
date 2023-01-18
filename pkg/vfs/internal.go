@@ -18,7 +18,9 @@ package vfs
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -183,7 +185,7 @@ func collectMetrics(registry *prometheus.Registry) []byte {
 	return w.Bytes()
 }
 
-func writeProgress(count, bytes *uint64, data *[]byte, done chan struct{}) {
+func writeProgress(count, bytes *uint64, out io.Writer, done chan struct{}) {
 	wb := utils.NewBuffer(17)
 	wb.Put8(meta.CPROGRESS)
 	if bytes == nil {
@@ -195,14 +197,14 @@ func writeProgress(count, bytes *uint64, data *[]byte, done chan struct{}) {
 		case <-ticker.C:
 			wb.Put64(atomic.LoadUint64(count))
 			wb.Put64(atomic.LoadUint64(bytes))
-			*data = append(*data, wb.Bytes()...)
+			_, _ = out.Write(wb.Bytes())
 			wb.Seek(1)
 		case <-done:
 			ticker.Stop()
 			if *count > 0 || *bytes > 0 {
 				wb.Put64(atomic.LoadUint64(count))
 				wb.Put64(atomic.LoadUint64(bytes))
-				*data = append(*data, wb.Bytes()...)
+				_, _ = out.Write(wb.Bytes())
 			}
 			return
 		}
@@ -247,24 +249,82 @@ func (v *VFS) caclObjects(id uint64, size, offset, length uint32) []*obj {
 	return objs
 }
 
-func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, data *[]byte) {
+type InfoResponse struct {
+	Ino     Ino
+	Failed  bool
+	Reason  string
+	Summary meta.Summary
+	Paths   []string
+	Chunks  []*chunkSlice
+	Objects []*chunkObj
+	PLocks  []meta.PLockItem
+	FLocks  []meta.FLockItem
+}
+
+type chunkSlice struct {
+	ChunkIndex uint64
+	meta.Slice
+}
+
+type chunkObj struct {
+	ChunkIndex     uint64
+	Key            string
+	Size, Off, Len uint32
+}
+
+func (r *InfoResponse) Encode() []byte {
+	resp, _ := json.Marshal(r)
+	buffer := utils.NewBuffer(4 + uint32(len(resp)))
+	buffer.Put32(uint32(len(resp)))
+	buffer.Put(resp)
+	return buffer.Bytes()
+}
+
+func (r *InfoResponse) Decode(reader io.Reader) error {
+	sizeBuf := make([]byte, 4)
+	n := 0
+	for n == 0 {
+		i, err := reader.Read(sizeBuf[n:])
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if i == 1 && sizeBuf[0] == byte(syscall.EINVAL&0xff) {
+			return syscall.EINVAL
+		}
+		n += i
+	}
+
+	size := utils.ReadBuffer(sizeBuf).Get32()
+	respBuf := make([]byte, size)
+	if _, err := io.ReadFull(reader, respBuf); err != nil {
+		return err
+	}
+	return json.Unmarshal(respBuf, r)
+}
+
+func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, out io.Writer) {
 	switch cmd {
 	case meta.Rmr:
 		done := make(chan struct{})
+		inode := Ino(r.Get64())
+		name := string(r.Get(int(r.Get8())))
 		var count uint64
 		var st syscall.Errno
 		go func() {
-			inode := Ino(r.Get64())
-			name := string(r.Get(int(r.Get8())))
 			st = v.Meta.Remove(ctx, inode, name, &count)
 			if st != 0 {
 				logger.Errorf("remove %d/%s: %s", inode, name, st)
 			}
 			close(done)
 		}()
-		writeProgress(&count, nil, data, done)
-		*data = append(*data, uint8(st))
-	case meta.Info:
+		writeProgress(&count, nil, out, done)
+		if st == 0 && v.InvalidateEntry != nil {
+			if st = v.InvalidateEntry(inode, name); st != 0 {
+				logger.Errorf("Invalidate entry %d/%s: %s", inode, name, st)
+			}
+		}
+		_, _ = out.Write([]byte{uint8(st)})
+	case meta.LegacyInfo:
 		var summary meta.Summary
 		inode := Ino(r.Get64())
 		var recursive uint8 = 1
@@ -281,7 +341,7 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, d
 		if r != 0 {
 			msg := r.Error()
 			wb.Put32(uint32(len(msg)))
-			*data = append(*data, append(wb.Bytes(), msg...)...)
+			_, _ = out.Write(append(wb.Bytes(), msg...))
 			return
 		}
 		var w = bytes.NewBuffer(nil)
@@ -290,7 +350,7 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, d
 		fmt.Fprintf(w, "   dirs: %d\n", summary.Dirs)
 		fmt.Fprintf(w, " length: %s\n", utils.FormatBytes(summary.Length))
 		fmt.Fprintf(w, "   size: %s\n", utils.FormatBytes(summary.Size))
-		ps := meta.GetPaths(v.Meta, ctx, inode)
+		ps := v.Meta.GetPaths(ctx, inode)
 		switch len(ps) {
 		case 0:
 			fmt.Fprintf(w, "   path: %s\n", "unknown")
@@ -313,9 +373,9 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, d
 				_ = v.Meta.Read(ctx, inode, uint32(indx), &cs)
 				for _, c := range cs {
 					if raw {
-						fmt.Fprintf(w, "\t%d:\t%d\t%d\t%d\t%d\n", indx, c.Chunkid, c.Size, c.Off, c.Len)
+						fmt.Fprintf(w, "\t%d:\t%d\t%d\t%d\t%d\n", indx, c.Id, c.Size, c.Off, c.Len)
 					} else {
-						for _, o := range v.caclObjects(c.Chunkid, c.Size, c.Off, c.Len) {
+						for _, o := range v.caclObjects(c.Id, c.Size, c.Off, c.Len) {
 							fmt.Fprintf(w, "\t%d:\t%s\t%d\t%d\t%d\n", indx, o.key, o.size, o.off, o.len)
 						}
 					}
@@ -323,7 +383,52 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, d
 			}
 		}
 		wb.Put32(uint32(w.Len()))
-		*data = append(*data, append(wb.Bytes(), w.Bytes()...)...)
+		_, _ = out.Write(append(wb.Bytes(), w.Bytes()...))
+	case meta.InfoV2:
+		inode := Ino(r.Get64())
+		info := &InfoResponse{
+			Ino: inode,
+		}
+
+		var recursive uint8 = 1
+		if r.HasMore() {
+			recursive = r.Get8()
+		}
+		var raw bool
+		if r.HasMore() {
+			raw = r.Get8() != 0
+		}
+
+		r := meta.GetSummary(v.Meta, ctx, inode, &info.Summary, recursive != 0)
+		if r != 0 {
+			info.Failed = true
+			info.Reason = r.Error()
+			_, _ = out.Write(info.Encode())
+			return
+		}
+
+		info.Paths = v.Meta.GetPaths(ctx, inode)
+		if info.Summary.Files == 1 && info.Summary.Dirs == 0 {
+			for indx := uint64(0); indx*meta.ChunkSize < info.Summary.Length; indx++ {
+				var cs []meta.Slice
+				_ = v.Meta.Read(ctx, inode, uint32(indx), &cs)
+				for _, c := range cs {
+					if raw {
+						info.Chunks = append(info.Chunks, &chunkSlice{indx, c})
+					} else {
+						for _, o := range v.caclObjects(c.Id, c.Size, c.Off, c.Len) {
+							info.Objects = append(info.Objects, &chunkObj{indx, o.key, o.size, o.off, o.len})
+						}
+					}
+				}
+			}
+		}
+
+		var err error
+		if info.PLocks, info.FLocks, err = v.Meta.ListLocks(ctx, inode); err != nil {
+			info.Reason = err.Error()
+		}
+		_, _ = out.Write(info.Encode())
 	case meta.FillCache:
 		paths := strings.Split(string(r.Get(int(r.Get32()))), "\n")
 		concurrent := r.Get16()
@@ -335,13 +440,13 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, d
 				v.fillCache(ctx, paths, int(concurrent), &count, &bytes)
 				close(done)
 			}()
-			writeProgress(&count, &bytes, data, done)
+			writeProgress(&count, &bytes, out, done)
 		} else {
 			go v.fillCache(meta.NewContext(ctx.Pid(), ctx.Uid(), ctx.Gids()), paths, int(concurrent), nil, nil)
 		}
-		*data = append(*data, uint8(0))
+		_, _ = out.Write([]byte{0})
 	default:
 		logger.Warnf("unknown message type: %d", cmd)
-		*data = append(*data, uint8(syscall.EINVAL&0xff))
+		_, _ = out.Write([]byte{byte(syscall.EINVAL & 0xff)})
 	}
 }

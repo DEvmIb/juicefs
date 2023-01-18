@@ -26,10 +26,10 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
-const gatewayMeta = "redis://127.0.0.1:6379/11"
+const gatewayMeta = "redis://127.0.0.1:6379/14"
 const gatewayVolume = "gateway-volume"
 const gatewayAddr = "localhost:9008"
-const webdavMeta = "redis://127.0.0.1:6379/12"
+const webdavMeta = "redis://127.0.0.1:6379/15"
 const webdavVolume = "webdav-volume"
 const webdavAddr = "localhost:9009"
 
@@ -66,6 +66,8 @@ func startWebdav(t *testing.T) {
 	ResetHttp()
 
 	go func() {
+		os.Setenv("WEBDAV_USER", "root")
+		os.Setenv("WEBDAV_PASSWORD", "1234")
 		if err := Main([]string{"", "webdav", webdavMeta, webdavAddr, "--no-usage-report"}); err != nil {
 			t.Errorf("gateway failed: %s", err)
 		}
@@ -74,7 +76,7 @@ func startWebdav(t *testing.T) {
 }
 
 func TestIntegration(t *testing.T) {
-	mountTemp(t, nil, true)
+	mountTemp(t, nil, nil, []string{"--enable-ioctl"})
 	defer umountTemp(t)
 	startGateway(t)
 	startWebdav(t)

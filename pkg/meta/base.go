@@ -19,6 +19,9 @@ package meta
 import (
 	"encoding/json"
 	"fmt"
+	"path"
+	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -29,12 +32,14 @@ import (
 
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
 	inodeBatch    = 100
-	chunkIDBatch  = 1000
+	sliceIdBatch  = 1000
 	minUpdateTime = time.Millisecond * 10
 	nlocks        = 1024
 )
@@ -54,12 +59,14 @@ type engine interface {
 	doFindStaleSessions(limit int) ([]uint64, error) // limit < 0 means all
 	doCleanStaleSession(sid uint64) error
 
+	scanAllChunks(ctx Context, ch chan<- cchunk, bar *utils.Bar) error
+	compactChunk(inode Ino, indx uint32, force bool)
 	doDeleteSustainedInode(sid uint64, inode Ino) error
 	doFindDeletedFiles(ts int64, limit int) (map[Ino]uint64, error) // limit < 0 means all
 	doDeleteFileData(inode Ino, length uint64)
 	doCleanupSlices()
-	doCleanupDelayedSlices(edge int64, limit int) (int, error)
-	doDeleteSlice(chunkid uint64, size uint32) error
+	doCleanupDelayedSlices(edge int64) (int, error)
+	doDeleteSlice(id uint64, size uint32) error
 
 	doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno
 	doLookup(ctx Context, parent Ino, name string, inode *Ino, attr *Attr) syscall.Errno
@@ -73,15 +80,41 @@ type engine interface {
 	doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno
 	doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno
 	doGetParents(ctx Context, inode Ino) map[Ino]int
+	doRepair(ctx Context, inode Ino, attr *Attr) syscall.Errno
+
+	scanTrashSlices(Context, trashSliceScan) error
+	scanPendingSlices(Context, pendingSliceScan) error
+	scanPendingFiles(Context, pendingFileScan) error
 
 	GetSession(sid uint64, detail bool) (*Session, error)
+}
+
+type trashSliceScan func(ss []Slice, ts int64) (clean bool, err error)
+type pendingSliceScan func(id uint64, size uint32) (clean bool, err error)
+type trashFileScan func(inode Ino, size uint64, ts time.Time) (clean bool, err error)
+type pendingFileScan func(ino Ino, size uint64, ts int64) (clean bool, err error)
+
+// fsStat aligned for atomic operations
+// nolint:structcheck
+type fsStat struct {
+	newSpace   int64
+	newInodes  int64
+	usedSpace  int64
+	usedInodes int64
+}
+
+// chunk for compaction
+type cchunk struct {
+	inode  Ino
+	indx   uint32
+	slices int
 }
 
 type baseMeta struct {
 	sync.Mutex
 	addr string
 	conf *Config
-	fmt  Format
+	fmt  *Format
 
 	root         Ino
 	txlocks      [nlocks]sync.Mutex // Pessimistic locks to reduce conflict
@@ -93,15 +126,15 @@ type baseMeta struct {
 	maxDeleting  chan struct{}
 	symlinks     *sync.Map
 	msgCallbacks *msgCallbacks
-	newSpace     int64
-	newInodes    int64
-	usedSpace    int64
-	usedInodes   int64
+	reloadCb     []func(*Format)
 	umounting    bool
+	sesMu        sync.Mutex
+
+	*fsStat
 
 	freeMu     sync.Mutex
 	freeInodes freeID
-	freeChunks freeID
+	freeSlices freeID
 
 	usedSpaceG  prometheus.Gauge
 	usedInodesG prometheus.Gauge
@@ -128,6 +161,7 @@ func newBaseMeta(addr string, conf *Config) *baseMeta {
 		compacting:   make(map[uint64]bool),
 		maxDeleting:  make(chan struct{}, 100),
 		symlinks:     &sync.Map{},
+		fsStat:       new(fsStat),
 		msgCallbacks: &msgCallbacks{
 			callbacks: make(map[uint32]MsgCallback),
 		},
@@ -226,24 +260,26 @@ func (r *baseMeta) newMsg(mid uint32, args ...interface{}) error {
 func (m *baseMeta) Load(checkVersion bool) (*Format, error) {
 	body, err := m.en.doLoad()
 	if err == nil && len(body) == 0 {
-		err = fmt.Errorf("database is not formatted")
+		err = fmt.Errorf("database is not formatted, please run `juicefs format ...` first")
 	}
 	if err != nil {
 		return nil, err
 	}
-	if err = json.Unmarshal(body, &m.fmt); err != nil {
+	var format Format
+	if err = json.Unmarshal(body, &format); err != nil {
 		return nil, fmt.Errorf("json: %s", err)
 	}
 	if checkVersion {
-		if err = m.fmt.CheckVersion(); err != nil {
+		if err = format.CheckVersion(); err != nil {
 			return nil, fmt.Errorf("check version: %s", err)
 		}
 	}
-	return &m.fmt, nil
+	m.fmt = &format
+	return m.fmt, nil
 }
 
 func (m *baseMeta) NewSession() error {
-	go m.refreshUsage()
+	go m.refresh()
 	if m.conf.ReadOnly {
 		logger.Infof("Create read-only session OK with version: %s", version.Version())
 		return nil
@@ -265,7 +301,6 @@ func (m *baseMeta) NewSession() error {
 	}
 	logger.Infof("Create session %d OK with version: %s", m.sid, version.Version())
 
-	go m.refreshSession()
 	if !m.conf.NoBGJob {
 		go m.cleanupDeletedFiles()
 		go m.cleanupSlices()
@@ -278,23 +313,56 @@ func (m *baseMeta) expireTime() int64 {
 	return time.Now().Add(5 * m.conf.Heartbeat).Unix()
 }
 
-func (m *baseMeta) refreshSession() {
+func (m *baseMeta) OnReload(fn func(f *Format)) {
+	m.msgCallbacks.Lock()
+	defer m.msgCallbacks.Unlock()
+	m.reloadCb = append(m.reloadCb, fn)
+}
+
+func (m *baseMeta) refresh() {
 	for {
 		utils.SleepWithJitter(m.conf.Heartbeat)
-		m.Lock()
+		m.sesMu.Lock()
 		if m.umounting {
-			m.Unlock()
+			m.sesMu.Unlock()
 			return
 		}
-		m.en.doRefreshSession()
-		m.Unlock()
+		if !m.conf.ReadOnly {
+			m.en.doRefreshSession()
+		}
+		m.sesMu.Unlock()
+
+		old := m.fmt
 		if _, err := m.Load(false); err != nil {
 			logger.Warnf("reload setting: %s", err)
+		} else if m.fmt.MetaVersion > MaxVersion {
+			logger.Fatalf("incompatible metadata version %d > max version %d", m.fmt.MetaVersion, MaxVersion)
+		} else if m.fmt.UUID != old.UUID {
+			logger.Fatalf("UUID changed from %s to %s", old, m.fmt.UUID)
+		} else if !reflect.DeepEqual(m.fmt, old) {
+			m.msgCallbacks.Lock()
+			cbs := m.reloadCb
+			m.msgCallbacks.Unlock()
+			for _, cb := range cbs {
+				cb(m.fmt)
+			}
 		}
-		if m.conf.NoBGJob {
+
+		if v, err := m.en.getCounter(usedSpace); err == nil {
+			atomic.StoreInt64(&m.usedSpace, v)
+		} else {
+			logger.Warnf("Get counter %s: %s", usedSpace, err)
+		}
+		if v, err := m.en.getCounter(totalInodes); err == nil {
+			atomic.StoreInt64(&m.usedInodes, v)
+		} else {
+			logger.Warnf("Get counter %s: %s", totalInodes, err)
+		}
+
+		if m.conf.ReadOnly || m.conf.NoBGJob {
 			continue
 		}
-		if ok, err := m.en.setIfSmall("lastCleanupSessions", time.Now().Unix(), int64(m.conf.Heartbeat/time.Second)); err != nil {
+		if ok, err := m.en.setIfSmall("lastCleanupSessions", time.Now().Unix(), int64((m.conf.Heartbeat * 9 / 10).Seconds())); err != nil {
 			logger.Warnf("checking counter lastCleanupSessions: %s", err)
 		} else if ok {
 			go m.CleanStaleSessions()
@@ -322,27 +390,11 @@ func (m *baseMeta) CloseSession() error {
 	if m.conf.ReadOnly {
 		return nil
 	}
-	m.Lock()
+	m.sesMu.Lock()
 	m.umounting = true
-	m.Unlock()
+	m.sesMu.Unlock()
 	logger.Infof("close session %d: %s", m.sid, m.en.doCleanStaleSession(m.sid))
 	return nil
-}
-
-func (m *baseMeta) refreshUsage() {
-	for {
-		if v, err := m.en.getCounter(usedSpace); err == nil {
-			atomic.StoreInt64(&m.usedSpace, v)
-		} else {
-			logger.Warnf("Get counter %s: %s", usedSpace, err)
-		}
-		if v, err := m.en.getCounter(totalInodes); err == nil {
-			atomic.StoreInt64(&m.usedInodes, v)
-		} else {
-			logger.Warnf("Get counter %s: %s", totalInodes, err)
-		}
-		utils.SleepWithJitter(time.Second * 10)
-	}
 }
 
 func (m *baseMeta) checkQuota(size, inodes int64) bool {
@@ -380,7 +432,7 @@ func (m *baseMeta) flushStats() {
 func (m *baseMeta) cleanupDeletedFiles() {
 	for {
 		utils.SleepWithJitter(time.Minute)
-		if ok, err := m.en.setIfSmall("lastCleanupFiles", time.Now().Unix(), 60); err != nil {
+		if ok, err := m.en.setIfSmall("lastCleanupFiles", time.Now().Unix(), int64(time.Minute.Seconds())*9/10); err != nil {
 			logger.Warnf("checking counter lastCleanupFiles: %s", err)
 		} else if ok {
 			files, err := m.en.doFindDeletedFiles(time.Now().Add(-time.Hour).Unix(), 10000)
@@ -399,7 +451,7 @@ func (m *baseMeta) cleanupDeletedFiles() {
 func (m *baseMeta) cleanupSlices() {
 	for {
 		utils.SleepWithJitter(time.Hour)
-		if ok, err := m.en.setIfSmall("nextCleanupSlices", time.Now().Unix(), 3600); err != nil {
+		if ok, err := m.en.setIfSmall("nextCleanupSlices", time.Now().Unix(), int64(time.Hour.Seconds())*9/10); err != nil {
 			logger.Warnf("checking counter nextCleanupSlices: %s", err)
 		} else if ok {
 			m.en.doCleanupSlices()
@@ -497,9 +549,6 @@ func (m *baseMeta) Lookup(ctx Context, parent Ino, name string, inode *Ino, attr
 		if st := m.GetAttr(ctx, parent, attr); st != 0 {
 			return st
 		}
-		if attr.Typ != TypeDirectory {
-			return syscall.ENOTDIR
-		}
 		*inode = parent
 		return 0
 	}
@@ -571,9 +620,9 @@ func (m *baseMeta) marshal(attr *Attr) []byte {
 	return w.Bytes()
 }
 
-func (m *baseMeta) encodeDelayedSlice(chunkid uint64, size uint32) []byte {
+func (m *baseMeta) encodeDelayedSlice(id uint64, size uint32) []byte {
 	w := utils.NewBuffer(8 + 4)
-	w.Put64(chunkid)
+	w.Put64(id)
 	w.Put32(size)
 	return w.Bytes()
 }
@@ -583,7 +632,7 @@ func (m *baseMeta) decodeDelayedSlices(buf []byte, ss *[]Slice) {
 		return
 	}
 	for rb := utils.FromBuffer(buf); rb.HasMore(); {
-		*ss = append(*ss, Slice{Chunkid: rb.Get64(), Size: rb.Get32()})
+		*ss = append(*ss, Slice{Id: rb.Get64(), Size: rb.Get32()})
 	}
 }
 
@@ -724,7 +773,8 @@ func (m *baseMeta) Mkdir(ctx Context, parent Ino, name string, mode uint16, cuma
 }
 
 func (m *baseMeta) Symlink(ctx Context, parent Ino, name string, path string, inode *Ino, attr *Attr) syscall.Errno {
-	return m.Mknod(ctx, parent, name, TypeSymlink, 0644, 022, 0, path, inode, attr)
+	// mode of symlink is ignored in POSIX
+	return m.Mknod(ctx, parent, name, TypeSymlink, 0777, 0, 0, path, inode, attr)
 }
 
 func (m *baseMeta) Link(ctx Context, inode, parent Ino, name string, attr *Attr) syscall.Errno {
@@ -743,7 +793,7 @@ func (m *baseMeta) Link(ctx Context, inode, parent Ino, name string, attr *Attr)
 
 	defer m.timeit(time.Now())
 	parent = m.checkRoot(parent)
-	defer func() { m.of.InvalidateChunk(inode, 0xFFFFFFFE) }()
+	defer func() { m.of.InvalidateChunk(inode, invalidateAttrOnly) }()
 	return m.en.doLink(ctx, inode, parent, name, attr)
 }
 
@@ -832,6 +882,19 @@ func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) syscal
 	if attr != nil && !attr.Full {
 		err = m.GetAttr(ctx, inode, attr)
 	}
+	if attr.Flags&FlagImmutable != 0 {
+		if flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0 {
+			return syscall.EPERM
+		}
+	}
+	if attr.Flags&FlagAppend != 0 {
+		if (flags&(syscall.O_WRONLY|syscall.O_RDWR)) != 0 && (flags&syscall.O_APPEND) == 0 {
+			return syscall.EPERM
+		}
+		if flags&syscall.O_TRUNC != 0 {
+			return syscall.EPERM
+		}
+	}
 	if err == 0 {
 		m.of.Open(inode, attr)
 	}
@@ -843,28 +906,31 @@ func (m *baseMeta) InvalidateChunkCache(ctx Context, inode Ino, indx uint32) sys
 	return 0
 }
 
-func (m *baseMeta) NewChunk(ctx Context, chunkid *uint64) syscall.Errno {
+func (m *baseMeta) NewSlice(ctx Context, id *uint64) syscall.Errno {
 	m.freeMu.Lock()
 	defer m.freeMu.Unlock()
-	if m.freeChunks.next >= m.freeChunks.maxid {
-		v, err := m.en.incrCounter("nextChunk", chunkIDBatch)
+	if m.freeSlices.next >= m.freeSlices.maxid {
+		v, err := m.en.incrCounter("nextChunk", sliceIdBatch)
 		if err != nil {
 			return errno(err)
 		}
-		m.freeChunks.next = uint64(v) - chunkIDBatch
-		m.freeChunks.maxid = uint64(v)
+		m.freeSlices.next = uint64(v) - sliceIdBatch
+		m.freeSlices.maxid = uint64(v)
 	}
-	*chunkid = m.freeChunks.next
-	m.freeChunks.next++
+	*id = m.freeSlices.next
+	m.freeSlices.next++
 	return 0
 }
 
 func (m *baseMeta) Close(ctx Context, inode Ino) syscall.Errno {
 	if m.of.Close(inode) {
 		m.Lock()
-		defer m.Unlock()
-		if m.removedFiles[inode] {
+		_, removed := m.removedFiles[inode]
+		if removed {
 			delete(m.removedFiles, inode)
+		}
+		m.Unlock()
+		if removed {
 			_ = m.en.doDeleteSustainedInode(m.sid, inode)
 		}
 	}
@@ -921,7 +987,7 @@ func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 }
 
 func (m *baseMeta) GetParents(ctx Context, inode Ino) map[Ino]int {
-	if inode == RootInode {
+	if inode == RootInode || inode == TrashInode {
 		return map[Ino]int{1: 1}
 	}
 	var attr Attr
@@ -936,38 +1002,315 @@ func (m *baseMeta) GetParents(ctx Context, inode Ino) map[Ino]int {
 	}
 }
 
-func (m *baseMeta) fileDeleted(opened bool, inode Ino, length uint64) {
+func (m *baseMeta) GetPaths(ctx Context, inode Ino) []string {
+	if inode == RootInode {
+		return []string{"/"}
+	}
+
+	if inode == TrashInode {
+		return []string{"/.trash"}
+	}
+
+	outside := "path not shown because it's outside of the mounted root"
+	getDirPath := func(ino Ino) (string, error) {
+		var names []string
+		var attr Attr
+		for ino != RootInode && ino != m.root {
+			if st := m.en.doGetAttr(ctx, ino, &attr); st != 0 {
+				return "", fmt.Errorf("getattr inode %d: %s", ino, st)
+			}
+			if attr.Typ != TypeDirectory {
+				return "", fmt.Errorf("inode %d is not a directory", ino)
+			}
+			var entries []*Entry
+			if st := m.en.doReaddir(ctx, attr.Parent, 0, &entries, -1); st != 0 {
+				return "", fmt.Errorf("readdir inode %d: %s", ino, st)
+			}
+			var name string
+			for _, e := range entries {
+				if e.Inode == ino {
+					name = string(e.Name)
+					break
+				}
+			}
+			if attr.Parent == RootInode && ino == TrashInode {
+				name = TrashName
+			}
+			if name == "" {
+				return "", fmt.Errorf("entry %d/%d not found", attr.Parent, ino)
+			}
+			names = append(names, name)
+			ino = attr.Parent
+		}
+		if m.root != RootInode && ino == RootInode {
+			return outside, nil
+		}
+		names = append(names, "/") // add root
+
+		for i, j := 0, len(names)-1; i < j; i, j = i+1, j-1 { // reverse
+			names[i], names[j] = names[j], names[i]
+		}
+		return path.Join(names...), nil
+	}
+
+	var paths []string
+	// inode != RootInode, parent is the real parent inode
+	for parent, count := range m.GetParents(ctx, inode) {
+		if count <= 0 {
+			continue
+		}
+		dir, err := getDirPath(parent)
+		if err != nil {
+			logger.Warnf("Get directory path of %d: %s", parent, err)
+			continue
+		} else if dir == outside {
+			paths = append(paths, outside)
+			continue
+		}
+		var entries []*Entry
+		if st := m.en.doReaddir(ctx, parent, 0, &entries, -1); st != 0 {
+			logger.Warnf("Readdir inode %d: %s", parent, st)
+			continue
+		}
+		var c int
+		for _, e := range entries {
+			if e.Inode == inode {
+				c++
+				paths = append(paths, path.Join(dir, string(e.Name)))
+			}
+		}
+		if c != count {
+			logger.Warnf("Expect to find %d entries under parent %d, but got %d", count, parent, c)
+		}
+	}
+	return paths
+}
+
+func (m *baseMeta) countDirNlink(ctx Context, inode Ino) (uint32, syscall.Errno) {
+	var entries []*Entry
+	if st := m.en.doReaddir(ctx, inode, 0, &entries, -1); st != 0 {
+		logger.Errorf("readdir inode %d: %s", inode, st)
+		return 0, st
+	}
+	var dirCounter uint32 = 2
+	for _, e := range entries {
+		if e.Attr.Typ == TypeDirectory {
+			dirCounter++
+		}
+	}
+	return dirCounter, 0
+}
+
+type metaWalkFunc func(ctx Context, inode Ino, path string, attr *Attr)
+
+func (m *baseMeta) walk(ctx Context, inode Ino, path string, attr *Attr, walkFn metaWalkFunc) syscall.Errno {
+	walkFn(ctx, inode, path, attr)
+	var entries []*Entry
+	st := m.en.doReaddir(ctx, inode, 1, &entries, -1)
+	if st != 0 {
+		logger.Errorf("list %s: %s", path, st)
+		return st
+	}
+	for _, entry := range entries {
+		if !entry.Attr.Full {
+			entry.Attr.Parent = inode
+		}
+		if st := m.walk(ctx, entry.Inode, filepath.Join(path, string(entry.Name)), entry.Attr, walkFn); st != 0 {
+			return st
+		}
+	}
+	return 0
+}
+
+func (m *baseMeta) Check(ctx Context, fpath string, repair bool, recursive bool) (st syscall.Errno) {
+	var attr Attr
+	var inode = RootInode
+	var parent = RootInode
+	attr.Typ = TypeDirectory
+	ps := strings.FieldsFunc(fpath, func(r rune) bool {
+		return r == '/'
+	})
+	for i, name := range ps {
+		parent = inode
+		if st = m.Lookup(ctx, parent, name, &inode, &attr); st != 0 {
+			logger.Errorf("Lookup parent %d name %s: %s", parent, name, st)
+			return
+		}
+		if !attr.Full && i < len(ps)-1 {
+			// missing attribute
+			p := "/" + path.Join(ps[:i+1]...)
+			if attr.Typ != TypeDirectory { // TODO: determine file size?
+				logger.Warnf("Attribute of %s (inode %d type %d) is missing and cannot be auto-repaired, please repair it manually or remove it", p, inode, attr.Typ)
+			} else {
+				logger.Warnf("Attribute of %s (inode %d) is missing, please re-run with '--path %s --repair' to fix it", p, inode, p)
+			}
+		}
+	}
+	if !attr.Full {
+		attr.Parent = parent
+	}
+
+	type node struct {
+		inode Ino
+		path  string
+		attr  *Attr
+	}
+	nodes := make(chan *node, 1000)
+	go func() {
+		defer close(nodes)
+		if recursive {
+			st = m.walk(ctx, inode, fpath, &attr, func(ctx Context, inode Ino, path string, attr *Attr) {
+				nodes <- &node{inode, path, attr}
+			})
+		} else {
+			nodes <- &node{inode, fpath, &attr}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for e := range nodes {
+				inode := e.inode
+				path := e.path
+				attr := e.attr
+				if attr.Typ != TypeDirectory {
+					// TODO
+					continue
+				}
+				if attr.Full {
+					nlink, st := m.countDirNlink(ctx, inode)
+					if st != 0 {
+						logger.Errorf("Count nlink for inode %d: %s", inode, st)
+						continue
+					}
+					if attr.Nlink == nlink {
+						continue
+					}
+					logger.Warnf("nlink of %s should be %d, but got %d", path, nlink, attr.Nlink)
+				} else {
+					logger.Warnf("attribute of %s is missing", path)
+				}
+
+				if repair {
+					if !attr.Full {
+						now := time.Now().Unix()
+						attr.Mode = 0644
+						attr.Uid = ctx.Uid()
+						attr.Gid = ctx.Gid()
+						attr.Atime = now
+						attr.Mtime = now
+						attr.Ctime = now
+						attr.Length = 4 << 10
+					}
+					if st1 := m.en.doRepair(ctx, inode, attr); st1 == 0 {
+						logger.Infof("Path %s (inode %d) is successfully repaired", path, inode)
+					} else {
+						logger.Errorf("Repair path %s inode %d: %s", path, inode, st1)
+					}
+				} else {
+					logger.Warnf("Path %s (inode %d) can be repaired, please re-run with '--path %s --repair' to fix it", path, inode, path)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return
+}
+
+func (m *baseMeta) Chroot(ctx Context, subdir string) syscall.Errno {
+	for subdir != "" {
+		ps := strings.SplitN(subdir, "/", 2)
+		if ps[0] != "" {
+			var attr Attr
+			var inode Ino
+			r := m.Lookup(ctx, m.root, ps[0], &inode, &attr)
+			if r == syscall.ENOENT {
+				r = m.Mkdir(ctx, m.root, ps[0], 0777, 0, 0, &inode, &attr)
+			}
+			if r != 0 {
+				return r
+			}
+			if attr.Typ != TypeDirectory {
+				return syscall.ENOTDIR
+			}
+			m.root = inode
+		}
+		if len(ps) == 1 {
+			break
+		}
+		subdir = ps[1]
+	}
+	return 0
+}
+
+func (m *baseMeta) GetFormat() Format {
+	return *m.fmt
+}
+
+func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.Errno {
+	var wg sync.WaitGroup
+	ch := make(chan cchunk, 1000000)
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func() {
+			for c := range ch {
+				logger.Debugf("Compacting chunk %d:%d (%d slices)", c.inode, c.indx, c.slices)
+				m.en.compactChunk(c.inode, c.indx, true)
+				bar.Increment()
+			}
+			wg.Done()
+		}()
+	}
+
+	err := m.en.scanAllChunks(ctx, ch, bar)
+	close(ch)
+	wg.Wait()
+	if err != nil {
+		logger.Warnf("Scan chunks: %s", err)
+		return errno(err)
+	}
+	return 0
+}
+
+func (m *baseMeta) fileDeleted(opened, force bool, inode Ino, length uint64) {
 	if opened {
 		m.Lock()
 		m.removedFiles[inode] = true
 		m.Unlock()
 	} else {
-		m.tryDeleteFileData(inode, length)
+		m.tryDeleteFileData(inode, length, force)
 	}
 }
 
-func (m *baseMeta) tryDeleteFileData(inode Ino, length uint64) {
-	select {
-	case m.maxDeleting <- struct{}{}:
-		go func() {
-			m.en.doDeleteFileData(inode, length)
-			<-m.maxDeleting
-		}()
-	default:
-		// will be cleanup later
+func (m *baseMeta) tryDeleteFileData(inode Ino, length uint64, force bool) {
+	if force {
+		m.maxDeleting <- struct{}{}
+	} else {
+		select {
+		case m.maxDeleting <- struct{}{}:
+		default:
+			return // will be cleanup later
+		}
 	}
+	go func() {
+		m.en.doDeleteFileData(inode, length)
+		<-m.maxDeleting
+	}()
 }
 
-func (m *baseMeta) deleteSlice(chunkid uint64, size uint32) {
-	if chunkid == 0 {
+func (m *baseMeta) deleteSlice(id uint64, size uint32) {
+	if id == 0 {
 		return
 	}
-	if err := m.newMsg(DeleteChunk, chunkid, size); err == nil || strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "not found") {
-		if err = m.en.doDeleteSlice(chunkid, size); err != nil {
-			logger.Errorf("delete slice %d: %s", chunkid, err)
+	if err := m.newMsg(DeleteSlice, id, size); err == nil {
+		if err = m.en.doDeleteSlice(id, size); err != nil {
+			logger.Errorf("delete slice %d: %s", id, err)
 		}
 	} else if !strings.Contains(err.Error(), "skip deleting") {
-		logger.Warnf("delete chunk %d (%d bytes): %s", chunkid, size, err)
+		logger.Warnf("delete slice %d (%d bytes): %s", id, size, err)
 	}
 }
 
@@ -1025,7 +1368,7 @@ func (m *baseMeta) cleanupTrash() {
 			}
 			continue
 		}
-		if ok, err := m.en.setIfSmall("lastCleanupTrash", time.Now().Unix(), 3600); err != nil {
+		if ok, err := m.en.setIfSmall("lastCleanupTrash", time.Now().Unix(), int64(time.Hour.Seconds())*9/10); err != nil {
 			logger.Warnf("checking counter lastCleanupTrash: %s", err)
 		} else if ok {
 			go m.doCleanupTrash(false)
@@ -1034,9 +1377,8 @@ func (m *baseMeta) cleanupTrash() {
 	}
 }
 
-func (m *baseMeta) doCleanupTrash(force bool) {
+func (m *baseMeta) CleanupTrashBefore(ctx Context, edge time.Time, increProgress func()) {
 	logger.Debugf("cleanup trash: started")
-	ctx := Background
 	now := time.Now()
 	var st syscall.Errno
 	var entries []*Entry
@@ -1054,18 +1396,19 @@ func (m *baseMeta) doCleanupTrash(force bool) {
 		}
 	}()
 	batch := 1000000
-	edge := now.Add(-time.Duration(24*m.fmt.TrashDays+1) * time.Hour)
 	for len(entries) > 0 {
 		e := entries[0]
 		ts, err := time.Parse("2006-01-02-15", string(e.Name))
 		if err != nil {
 			logger.Warnf("bad entry as a subTrash: %s", e.Name)
+			entries = entries[1:]
 			continue
 		}
-		if ts.Before(edge) || force {
+		if ts.Before(edge) {
 			var subEntries []*Entry
 			if st = m.en.doReaddir(ctx, e.Inode, 0, &subEntries, batch); st != 0 {
 				logger.Warnf("readdir subTrash %d: %s", e.Inode, st)
+				entries = entries[1:]
 				continue
 			}
 			rmdir := len(subEntries) < batch
@@ -1080,6 +1423,9 @@ func (m *baseMeta) doCleanupTrash(force bool) {
 				}
 				if st == 0 {
 					count++
+					if increProgress != nil {
+						increProgress()
+					}
 				} else {
 					logger.Warnf("delete from trash %s/%s: %s", e.Name, se.Name, st)
 					rmdir = false
@@ -1100,18 +1446,82 @@ func (m *baseMeta) doCleanupTrash(force bool) {
 	}
 }
 
+func (m *baseMeta) scanTrashFiles(ctx Context, scan trashFileScan) error {
+	var st syscall.Errno
+	var entries []*Entry
+	if st = m.en.doReaddir(ctx, TrashInode, 1, &entries, -1); st != 0 {
+		return errors.Wrap(st, "read trash")
+	}
+
+	var subEntries []*Entry
+	for _, entry := range entries {
+		ts, err := time.Parse("2006-01-02-15", string(entry.Name))
+		if err != nil {
+			logger.Warnf("bad entry as a subTrash: %s", entry.Name)
+			continue
+		}
+		subEntries = subEntries[:0]
+		if st = m.en.doReaddir(ctx, entry.Inode, 1, &subEntries, -1); st != 0 {
+			logger.Warnf("readdir subEntry %d: %s", entry.Inode, st)
+			continue
+		}
+		for _, se := range subEntries {
+			if se.Attr.Typ == TypeFile {
+				clean, err := scan(se.Inode, se.Attr.Length, ts)
+				if err != nil {
+					return errors.Wrap(err, "scan trash files")
+				}
+				if clean {
+					// TODO: m.en.doUnlink(ctx, entry.Attr.Parent, string(entry.Name))
+					// avoid lint warning
+					_ = clean
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (m *baseMeta) doCleanupTrash(force bool) {
+	edge := time.Now().Add(-time.Duration(24*m.fmt.TrashDays+1) * time.Hour)
+	if force {
+		edge = time.Now()
+	}
+	m.CleanupTrashBefore(Background, edge, nil)
+}
+
 func (m *baseMeta) cleanupDelayedSlices() {
 	now := time.Now()
 	edge := now.Unix() - int64(m.fmt.TrashDays)*24*3600
 	logger.Debugf("Cleanup delayed slices: started with edge %d", edge)
-	if count, err := m.en.doCleanupDelayedSlices(edge, 3e5); err == nil {
-		msg := fmt.Sprintf("Cleanup delayed slices: deleted %d slices in %v", count, time.Since(now))
-		if count >= 3e5 {
-			logger.Warnf("%s (reached max limit, stop)", msg)
-		} else {
-			logger.Debugf(msg)
-		}
-	} else {
+	if count, err := m.en.doCleanupDelayedSlices(edge); err != nil {
 		logger.Warnf("Cleanup delayed slices: deleted %d slices in %v, but got error: %s", count, time.Since(now), err)
+	} else if count > 0 {
+		logger.Infof("Cleanup delayed slices: deleted %d slices in %v", count, time.Since(now))
 	}
+}
+
+func (m *baseMeta) ScanDeletedObject(ctx Context, tss trashSliceScan, pss pendingSliceScan, tfs trashFileScan, pfs pendingFileScan) error {
+	eg := errgroup.Group{}
+	if tss != nil {
+		eg.Go(func() error {
+			return m.en.scanTrashSlices(ctx, tss)
+		})
+	}
+	if pss != nil {
+		eg.Go(func() error {
+			return m.en.scanPendingSlices(ctx, pss)
+		})
+	}
+	if tfs != nil {
+		eg.Go(func() error {
+			return m.scanTrashFiles(ctx, tfs)
+		})
+	}
+	if pfs != nil {
+		eg.Go(func() error {
+			return m.en.scanPendingFiles(ctx, pfs)
+		})
+	}
+	return eg.Wait()
 }

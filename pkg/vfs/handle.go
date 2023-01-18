@@ -32,6 +32,7 @@ type handle struct {
 
 	// for dir
 	children []*meta.Entry
+	readAt   time.Time
 
 	// for file
 	locks      uint8
@@ -51,6 +52,13 @@ type handle struct {
 	data    []byte
 	pending []byte
 	bctx    meta.Context
+}
+
+func (h *handle) Write(buf []byte) (int, error) {
+	h.Lock()
+	defer h.Unlock()
+	h.data = append(h.data, buf...)
+	return len(buf), nil
 }
 
 func (h *handle) addOp(ctx Context) {

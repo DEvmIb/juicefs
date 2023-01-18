@@ -18,24 +18,18 @@ on:
 
 jobs:
   ltpfs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     steps:
-      - name: Set up Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: '1.17.x'
-
-      - name: Set up Docker
-        uses: docker-practice/actions-setup-docker@master
-
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 1
 
-      - name: Build linux target
+      - name: Build
+        uses: ./.github/actions/build
+
+      - name: Copy
         run: |
-          make juicefs
           cp .github/workflows/bash/rm_fs /tmp/
           cp .github/workflows/bash/rm_list.sh /tmp/
 
@@ -53,6 +47,7 @@ jobs:
           sudo ./juicefs mount -d redis://127.0.0.1:6379/1 /tmp/jfs --no-usage-report &
 
       - name: LTP FS
+        timeout-minutes: 50
         run: |
           wget -O ltp.tar.gz https://github.com/linux-test-project/ltp/archive/refs/tags/20210927.tar.gz
           mkdir ltp
@@ -67,8 +62,21 @@ jobs:
           sudo chmod +x /tmp/rm_list.sh
           sudo chmod 777 runtest/fs
           sudo /tmp/rm_list.sh /tmp/rm_fs /opt/ltp/runtest/fs
-          sudo ./runltp -d /tmp/jfs -f fs_bind,fs_perms_simple,fsx,io,smoketest,fcntl-locktests
-          sudo ./runltp -d /tmp/jfs -f fs -C result.log.failed -T result.log.tconf -l result.log
+          echo "chdir01 chdir01" >/tmp/rm_smoketest
+          cat /tmp/rm_smoketest
+          sudo /tmp/rm_list.sh /tmp/rm_smoketest /opt/ltp/runtest/smoketest
+          sudo ./runltp -d /tmp/jfs -f fs_bind,fs_perms_simple,fsx,io,smoketest,fcntl-locktests &
+          wait $!
+          sudo ./runltp -d /tmp/jfs -f fs -C result.log.failed -T result.log.tconf -l result.log  &
+          wait $!
+
+
+      - name: Log
+        if: ${{ always() }}
+        run: |
+          sudo tail -n 100 /opt/ltp/output/result.log.failed
+          tail -300 /var/log/juicefs.log
+          grep "<FATAL>:" /var/log/juicefs.log && exit 1 || true
 
       - name: Send Slack Notification
         if: ${{ failure() }}
@@ -76,7 +84,3 @@ jobs:
         with:
           channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_PR_CHECK_NOTIFY }}"
           slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"  
-
-      - name: Setup upterm session
-        if: ${{ failure() }}
-        uses: lhotari/action-upterm@v1

@@ -200,7 +200,10 @@ type uFileListObjectsOutput struct {
 	DataSet []*DataItem `json:"DataSet,omitempty"`
 }
 
-func (u *ufile) List(prefix, marker string, limit int64) ([]Object, error) {
+func (u *ufile) List(prefix, marker, delimiter string, limit int64) ([]Object, error) {
+	if delimiter != "" {
+		return nil, notSupportedDelimiter
+	}
 	query := url.Values{}
 	query.Add("list", "")
 	query.Add("prefix", prefix)
@@ -245,7 +248,7 @@ func (u *ufile) CreateMultipartUpload(key string) (*MultipartUpload, error) {
 }
 
 func (u *ufile) UploadPart(key string, uploadID string, num int, data []byte) (*Part, error) {
-	// UFile require the PartNumber to start from 0 (continious)
+	// UFile require the PartNumber to start from 0 (continuous)
 	num--
 	path := fmt.Sprintf("%s?uploadId=%s&partNumber=%d", key, uploadID, num)
 	resp, err := u.request("PUT", path, bytes.NewReader(data), nil)

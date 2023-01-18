@@ -18,10 +18,8 @@ package cmd
 
 import (
 	"bytes"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -147,6 +145,11 @@ Details: https://juicefs.com/docs/community/quick_start_guide`,
 				Name:  "encrypt-rsa-key",
 				Usage: "a path to RSA private key (PEM)",
 			},
+			&cli.StringFlag{
+				Name:  "encrypt-algo",
+				Usage: "encrypt algorithm (aes256gcm-rsa, chacha20-rsa)",
+				Value: object.AES256GCM_RSA,
+			},
 			&cli.IntFlag{
 				Name:  "trash-days",
 				Value: 1,
@@ -193,7 +196,6 @@ func createStorage(format meta.Format) (object.ObjectStorage, error) {
 	object.UserAgent = "JuiceFS-" + version.Version()
 	var blob object.ObjectStorage
 	var err error
-
 	if u, err := url.Parse(format.Bucket); err == nil {
 		values := u.Query()
 		if values.Get("tls-insecure-skip-verify") != "" {
@@ -201,7 +203,7 @@ func createStorage(format meta.Format) (object.ObjectStorage, error) {
 			if tlsSkipVerify, err = strconv.ParseBool(values.Get("tls-insecure-skip-verify")); err != nil {
 				return nil, err
 			}
-			object.GetHttpClient().Transport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: tlsSkipVerify}
+			object.GetHttpClient().Transport.(*http.Transport).TLSClientConfig.InsecureSkipVerify = tlsSkipVerify
 			values.Del("tls-insecure-skip-verify")
 			u.RawQuery = values.Encode()
 			format.Bucket = u.String()
@@ -220,24 +222,22 @@ func createStorage(format meta.Format) (object.ObjectStorage, error) {
 
 	if format.EncryptKey != "" {
 		passphrase := os.Getenv("JFS_RSA_PASSPHRASE")
-		block, _ := pem.Decode([]byte(format.EncryptKey))
-		if block == nil {
-			return nil, errors.New("failed to parse PEM block containing the key")
-		}
-		// nolint:staticcheck
-		if strings.Contains(block.Headers["Proc-Type"], "ENCRYPTED") && x509.IsEncryptedPEMBlock(block) {
-			if passphrase == "" {
+		if passphrase == "" {
+			block, _ := pem.Decode([]byte(format.EncryptKey))
+			// nolint:staticcheck
+			if block != nil && strings.Contains(block.Headers["Proc-Type"], "ENCRYPTED") && x509.IsEncryptedPEMBlock(block) {
 				return nil, fmt.Errorf("passphrase is required to private key, please try again after setting the 'JFS_RSA_PASSPHRASE' environment variable")
 			}
-		} else if passphrase != "" {
-			logger.Warningf("passphrase is not used, because private key is not encrypted")
 		}
 
-		privKey, err := object.ParseRsaPrivateKeyFromPem(block, passphrase)
+		privKey, err := object.ParseRsaPrivateKeyFromPem([]byte(format.EncryptKey), []byte(passphrase))
 		if err != nil {
-			return nil, fmt.Errorf("incorrect passphrase: %s", err)
+			return nil, fmt.Errorf("parse rsa: %s", err)
 		}
-		encryptor := object.NewAESEncryptor(object.NewRSAEncryptor(privKey))
+		encryptor, err := object.NewDataEncryptor(object.NewRSAEncryptor(privKey), format.EncryptAlgo)
+		if err != nil {
+			return nil, err
+		}
 		blob = object.NewEncrypted(blob, encryptor)
 	}
 	return blob, nil
@@ -377,11 +377,11 @@ func format(c *cli.Context) error {
 				format.HashPrefix = c.Bool(flag)
 			case "storage":
 				format.Storage = c.String(flag)
-			case "encrypt-rsa-key":
+			case "encrypt-rsa-key", "encrypt-algo":
 				logger.Warnf("Flag %s is ignored since it cannot be updated", flag)
 			}
 		}
-	} else if err.Error() == "database is not formatted" {
+	} else if strings.HasPrefix(err.Error(), "database is not formatted") {
 		create = true
 		format = &meta.Format{
 			Name:         name,
@@ -392,6 +392,7 @@ func format(c *cli.Context) error {
 			SecretKey:    c.String("secret-key"),
 			SessionToken: c.String("session-token"),
 			EncryptKey:   loadEncrypt(c.String("encrypt-rsa-key")),
+			EncryptAlgo:  c.String("encrypt-algo"),
 			Shards:       c.Int("shards"),
 			HashPrefix:   c.Bool("hash-prefix"),
 			Capacity:     c.Uint64("capacity") << 30,
@@ -399,7 +400,7 @@ func format(c *cli.Context) error {
 			BlockSize:    fixObjectSize(c.Int("block-size")),
 			Compression:  c.String("compress"),
 			TrashDays:    c.Int("trash-days"),
-			MetaVersion:  1,
+			MetaVersion:  meta.MaxVersion,
 		}
 		if format.AccessKey == "" && os.Getenv("ACCESS_KEY") != "" {
 			format.AccessKey = os.Getenv("ACCESS_KEY")
@@ -463,7 +464,7 @@ func format(c *cli.Context) error {
 			logger.Fatalf("Format encrypt: %s", err)
 		}
 	}
-	if err = m.Init(*format, c.Bool("force")); err != nil {
+	if err = m.Init(format, c.Bool("force")); err != nil {
 		if create {
 			_ = blob.Delete("juicefs_uuid")
 		}

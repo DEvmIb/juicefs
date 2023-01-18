@@ -1,29 +1,37 @@
+---
+sidebar_position: 2
+---
 # Trash
 
 :::note
 This feature requires JuiceFS v1.0.0 or higher
 :::
 
-Data safety is always critical for a storage system. JuiceFS enables **trash** feature by default to keep user-removed files for a certain period in a hidden directory named `.trash`.
+Data security is crucial for storage system, therefore JuiceFS enables the trash feature by default: files deleted by user will be kept in a hidden directory named `.trash` under JuiceFS root, and wait for expiration.
 
-## Configure
+With trash enabled, if application frequently delete or overwrite files, expect larger usage in object storage than the actual file system, because trash directory contain the following type of files:
 
-When using `juicefs format` command to initialize JuiceFS volume, users may specify `--trash-days <val>` to configure the number of days during which files are kept in the `.trash` directory. Within this period, user-removed files are not actually purged, so you won't see decreased number in `df` output, and can still find blocks in the object storage.
+1. Files deleted by user, they can be directly viewed and manipulated in the `.trash` directory
+2. Data blocks created during file overwrites (see [FAQ](../faq.md#what-is-the-implementation-principle-of-juicefs-supporting-random-write)) are kept in trash as well, but users won't be able to see these files, thus cannot be force deleted by default, see [Recovery/Purge](#recover-purge)
 
-- the default value of `trash-days` is 1, which means files in trash will be automatically purged after ONE day.
+## Configure {#configure}
+
+When using `juicefs format` command to initialize JuiceFS volume, users are allowed to specify `--trash-days <val>` to set the number of days which files are kept in the `.trash` directory. Within this period, user-removed files are not actually purged, so the file system usage shown in the output of `df` command will not decrease, and the blocks in the object storage will still exist.
+
+- the value of `trash-days` defaults to 1, which means files in trash will be automatically purged after ONE day.
 - use `--trash-days 0` to disable this feature; the trash will be emptied in a short time, and all files removed afterwards will be purged immediately.
-- trash is disabled for older versions. If you want to enable it for an existed volume, please upgrade **ALL** clients first and then change `--trash-days` to a positive value manually.
+- For older versions of JuiceFS to use the trash, you need to manually set `--trash-days` to the desired positive integer value via the `config` command after upgrading all mount points.
 
-After initializing a volume, you can still update `trash-days` with the `config` command, e.g:
+For volumes already been initialized, you can still update `trash-days` with the `config` command, e.g:
 
 ```bash
-$ juicefs config META-URL --trash-days 7
+juicefs config META-URL --trash-days 7
 ```
 
-Then you can check new configurations through `status` command:
+Verify using the `status` command:
 
 ```bash
-$ juicefs status META-URL
+juicefs status META-URL
 
 {
   "Setting": {
@@ -35,28 +43,42 @@ $ juicefs status META-URL
 
 ## Usage
 
-The `.trash` directory is automatically created under JuiceFS root `/`, which can be accessed as the mount point.
+The `.trash` directory resides under the root of the JuiceFS mount point, use it like this for example:
+
+```shell
+cd /jfs
+
+# Empty trash directory
+# Note: The level-1 subdirectory in the trash directory (for example, '2022-11-30-10', whose main function is to generalize management, does not take up space) cannot be manually deleted.
+juicefs rmr .trash/
+
+# Recover files from trash directory
+# Note: original directory structure is lost, however inode info will be prefixed in the file name, continue reading for more
+mv .trash/2022-11-30-10/[parent inode]-[file inode]-[file name] .
+```
+
+When mounting a subdirectory, you will not be able to enter the trash directory.
 
 ### Tree Structure
 
-There are only two levels under the tree rooted by `.trash`. The first one is a list of directories that are automatically created by JuiceFS and named as `year-month-day-hour` (e.g. `2021-11-30-10`). All files removed in a certain hour will be moved into the corresponding directory. The second level is just a plain list of removed files and empty directories (usually `rm -rf <dir>` will remove files in `dir` first, and then remove the empty `dir`). Obviously, the original tree structure is lost when files are moved into the trash. To save as much information as possible of the original hierarchy without impact on the performance, JuiceFS renames files in trash to `{parentInode-fileInode-fileName}`. Here `inode` is an internal number used for file system organizing, and can be ignored if you only care about name of the original file.
+There are only two levels under the tree rooted by `.trash`. The first one is a list of directories that are automatically created by JuiceFS and named as `year-month-day-hour` (e.g. `2021-11-30-10`). All files removed within an hour will be moved into the corresponding directory. The second level is just a plain list of removed files and empty directories (the usual `rm -rf <dir>` command removes files in `<dir>` first, and then removes the empty `<dir>` itself). **The original directory structure is lost when files are moved into the trash.** To save as much information about the original hierarchy as possible without impact on the performance, JuiceFS renames files in trash to `{parentInode-fileInode-fileName}`. Here `inode` is an internal number used for organizing file system (use [`juicefs info`](../reference/command_reference.md#info) to check file inode), and can be ignored if you only care about the name of the original file.
 
 :::note
-UTC is used when naming directories in the first level.
+The first level directory is named after the UTC time.
 :::
 
-:::tip
-You can use `juicefs info` to check inode of a file or directory.
-:::
+### Privileges
 
-### Access
+All users are allowed to browse the trash directory and see the full list of removed files. However, since JuiceFS keeps the original modes of the trashed files, normal users can only read files that they have permission to. The `.trash` directory is hidden if JuiceFS is mounted with `--subdir <dir>`.
 
-All users are allowed to browse the trash and see the full list of removed files. However, files in trash keep their original modes, so users can only read files that they can read before. If JuiceFS is mounted with `--subdir <dir>` (mostly used as a CSI driver on Kubernetes), the whole trash will be hidden and can't be accessed.
+User cannot create new files inside the trash directory, and only root are allowed to move or delete files in trash.
 
-It is not permitted to create files within the trash. Deleting or purging a file are forbidden as well for non-root users, even if he/she is owner of this file.
+When the juicefs mount process is started by a non-root user, the `-o allow_root` parameter must be specified during the mount; otherwise, the trash cannot be emptied normally.
 
-### Recover/Purge
+### Recover/Purge {#recover-purge}
 
-It is suggested to ask root user to recover files, since root is allowed to move them out of trash with a single `mv` command, and causes no data copy. Other users, however, can only recover a file by reading its content and write it to another new file.
+Recover/Purge files in trash are only available for root users, simply use `mv` command to recover a file, or use `rm` to permanently delete a file. Normal users, however, can only recover a file by reading its content and write it to a new file.
 
-JuiceFS client will check the trash every hour and purge old entries. At least one active client is required to make it happen. Like recovering, only root user is allowed to manually purge entries by `rm` command.
+JuiceFS Client is in charge of periodically checking trash and expire old entries (run every hour by default), so you need at least one active client mounted (without [`--no-bgjob`](../reference/command_reference.md#mount)). If you wish to quickly free up object storage, you can manually delete files in the `.trash` directory using the `rm` command.
+
+Furthermore, garbage blocks created by file overwrites are not visible to users, if you must force delete them, you'll have to temporarily disable trash (setting [`--trash-days 0`](#configure)), and then manually run garbage collection using [`juicefs gc`](../reference/command_reference.md#gc). Remember to re-enable trash after done.

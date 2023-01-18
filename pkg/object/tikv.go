@@ -89,7 +89,10 @@ func (t *tikv) Delete(key string) error {
 	return t.c.Delete(context.TODO(), []byte(key))
 }
 
-func (t *tikv) List(prefix, marker string, limit int64) ([]Object, error) {
+func (t *tikv) List(prefix, marker, delimiter string, limit int64) ([]Object, error) {
+	if delimiter != "" {
+		return nil, notSupportedDelimiter
+	}
 	if marker == "" {
 		marker = prefix
 	}
@@ -101,7 +104,7 @@ func (t *tikv) List(prefix, marker string, limit int64) ([]Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	var objs []Object = make([]Object, len(keys))
+	var objs = make([]Object, len(keys))
 	mtime := time.Now()
 	for i, k := range keys {
 		// FIXME: mtime
@@ -127,7 +130,10 @@ func newTiKV(endpoint, accesskey, secretkey, token string) (ObjectStorage, error
 	l, prop, _ := plog.InitLogger(&plog.Config{Level: plvl})
 	plog.ReplaceGlobals(l, prop)
 
-	tUrl, err := url.Parse("tikv://" + endpoint)
+	if !strings.HasPrefix(endpoint, "tikv://") {
+		endpoint = "tikv://" + endpoint
+	}
+	tUrl, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, err
 	}

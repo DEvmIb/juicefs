@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/pkg/errors"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -275,8 +277,8 @@ func (f *sftpStore) Chown(key string, owner, group string) error {
 		return err
 	}
 	defer f.putSftpConnection(&c, err)
-	uid := lookupUser(owner)
-	gid := lookupGroup(group)
+	uid := utils.LookupUser(owner)
+	gid := utils.LookupGroup(group)
 	return c.sftpClient.Chown(f.path(key), uid, gid)
 }
 
@@ -390,7 +392,7 @@ func (f *sftpStore) find(c *sftp.Client, path, marker string, out chan Object) {
 	}
 }
 
-func (f *sftpStore) List(prefix, marker string, limit int64) ([]Object, error) {
+func (f *sftpStore) List(prefix, marker, delimiter string, limit int64) ([]Object, error) {
 	return nil, notSupported
 }
 
@@ -430,6 +432,14 @@ func SshInteractive(user, instruction string, questions []string, echos []bool) 
 	}
 	return answers, nil
 }
+func unescape(original string) string {
+	if escaped, err := url.QueryUnescape(original); err != nil {
+		logger.Warnf("unescape(%s) error: %s", original, err)
+		return original
+	} else {
+		return escaped
+	}
+}
 
 func newSftp(endpoint, username, pass, token string) (ObjectStorage, error) {
 	idx := strings.LastIndex(endpoint, ":")
@@ -455,8 +465,10 @@ func newSftp(endpoint, username, pass, token string) (ObjectStorage, error) {
 			username = u.Username
 		}
 	}
+	username = unescape(username)
 	var auth []ssh.AuthMethod
 	if pass != "" {
+		pass = unescape(pass)
 		auth = append(auth, ssh.Password(pass))
 	} else {
 		auth = append(auth, ssh.KeyboardInteractive(SshInteractive))

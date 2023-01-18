@@ -1,8 +1,6 @@
 ---
-sidebar_label: 在 WSL 中使用 JuiceFS
+title: 在 WSL 中使用 JuiceFS
 ---
-
-# 在 WSL 中使用 JuiceFS
 
 WSL 全称 Windows Subsystem for Linux，即适用于 Linux 的 Windows 子系统。它可以让你在 Windows 系统环境下运行大多数 GNU/Linux 原生命令、工具和程序，且不必像用虚拟机或双系统那样产生额外的硬件开销。
 
@@ -87,7 +85,7 @@ JuiceFS 是数据与元数据分离的分布式文件系统，通常用对象存
 
 #### 对象存储
 
-查看「[JuiceFS 支持的数据存储](../reference/how_to_setup_object_storage.md)」
+查看「[JuiceFS 支持的数据存储](../guide/how_to_set_up_object_storage.md)」
 
 - **Bucket Endpoint**：`https://myjfs.oss-cn-shanghai.aliyuncs.com`
 - **Access Key ID**：`ABCDEFGHIJKLMNopqXYZ`
@@ -95,7 +93,7 @@ JuiceFS 是数据与元数据分离的分布式文件系统，通常用对象存
 
 #### 数据库
 
-查看「[JuiceFS 支持的元数据引擎](../reference/how_to_setup_metadata_engine.md)」
+查看「[JuiceFS 支持的元数据引擎](../guide/how_to_set_up_metadata_engine.md)」
 
 - **数据库地址**：`myjfs-sh-abc.redis.rds.aliyuncs.com:6379`
 - **数据库密码**：`mypassword`
@@ -103,9 +101,9 @@ JuiceFS 是数据与元数据分离的分布式文件系统，通常用对象存
 将私密信息写入环境变量：
 
 ```shell
-$ export ACCESS_KEY=ABCDEFGHIJKLMNopqXYZ
-$ export SECRET_KEY=ZYXwvutsrqpoNMLkJiHgfeDCBA
-$ export REDIS_PASSWORD=mypassword
+export ACCESS_KEY=ABCDEFGHIJKLMNopqXYZ
+export SECRET_KEY=ZYXwvutsrqpoNMLkJiHgfeDCBA
+export REDIS_PASSWORD=mypassword
 ```
 
 创建名为 `myjfs` 的文件系统：

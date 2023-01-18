@@ -23,10 +23,13 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"math"
 	"os"
 	"reflect"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -47,7 +50,7 @@ func get(s ObjectStorage, k string, off, limit int64) (string, error) {
 }
 
 func listAll(s ObjectStorage, prefix, marker string, limit int64) ([]Object, error) {
-	r, err := s.List(prefix, marker, limit)
+	r, err := s.List(prefix, marker, "", limit)
 	if !errors.Is(err, notSupported) {
 		return r, nil
 	}
@@ -170,6 +173,79 @@ func testStorage(t *testing.T, s ObjectStorage) {
 		}
 	}
 
+	defer s.Delete("a/a")
+	if err := s.Put("a/a", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+	defer s.Delete("a/a1")
+	if err := s.Put("a/a1", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+	defer s.Delete("b/b")
+	if err := s.Put("b/b", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+	defer s.Delete("b/b1")
+	if err := s.Put("b/b1", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+	defer s.Delete("c/")
+	//tikv will appear empty value is not supported
+	if err1 := s.Put("c/", bytes.NewReader(nil)); err1 != nil {
+		//minio will appear XMinioObjectExistsAsDirectory: Object name already exists as a directory. status code:  409
+		if err2 := s.Put("c/", bytes.NewReader(br)); err2 != nil {
+			t.Fatalf("PUT failed err1: %s, err2: %s", err1.Error(), err2.Error())
+		}
+	}
+	defer s.Delete("a1")
+	if err := s.Put("a1", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+	if obs, err := s.List("", "", "/", 10); err != nil {
+		if !(errors.Is(err, notSupportedDelimiter) || errors.Is(err, notSupported)) {
+			t.Fatalf("list with delimiter: %s", err)
+		} else {
+			t.Logf("list api error: %s", err)
+		}
+	} else {
+		if len(obs) != 5 {
+			t.Fatalf("list with delimiter should return five results but got %d", len(obs))
+		}
+		keys := []string{"a/", "a1", "b/", "c/", "test"}
+		for i, o := range obs {
+			if o.Key() != keys[i] {
+				t.Fatalf("should get key %s but got %s", keys[i], o.Key())
+			}
+		}
+	}
+
+	// test redis cluster list all api
+	keyTotal := 100
+	var sortedKeys []string
+	for i := 0; i < keyTotal; i++ {
+		k := fmt.Sprintf("hashKey%d", i)
+		sortedKeys = append(sortedKeys, k)
+		if err := s.Put(k, bytes.NewReader(br)); err != nil {
+			t.Fatalf("PUT failed: %s", err.Error())
+		}
+	}
+	sort.Strings(sortedKeys)
+	defer func() {
+		for i := 0; i < keyTotal; i++ {
+			_ = s.Delete(fmt.Sprintf("hashKey%d", i))
+		}
+	}()
+	objs, err := listAll(s, "hashKey", "", int64(keyTotal))
+	if err != nil {
+		t.Fatalf("list4 failed: %s", err.Error())
+	} else {
+		for i := 0; i < keyTotal; i++ {
+			if objs[i].Key() != sortedKeys[i] {
+				t.Fatal("The result for list4 is incorrect")
+			}
+		}
+	}
+
 	f, _ := ioutil.TempFile("", "test")
 	f.Write([]byte("this is a file"))
 	f.Seek(0, 0)
@@ -268,6 +344,7 @@ func TestMem(t *testing.T) {
 }
 
 func TestDisk(t *testing.T) {
+	_ = os.RemoveAll("/tmp/abc/")
 	s, _ := newDisk("/tmp/abc/", "", "", "")
 	testStorage(t, s)
 }
@@ -298,6 +375,39 @@ func TestS3(t *testing.T) {
 		os.Getenv("AWS_SECRET_ACCESS_KEY"),
 		os.Getenv("AWS_SESSION_TOKEN"))
 	testStorage(t, s)
+}
+
+func TestOracleCompileRegexp(t *testing.T) {
+	ep := "axntujn0ebj1.compat.objectstorage.ap-singapore-1.oraclecloud.com"
+	oracleCompile := regexp.MustCompile(oracleCompileRegexp)
+	if oracleCompile.MatchString(ep) {
+		if submatch := oracleCompile.FindStringSubmatch(ep); len(submatch) >= 2 {
+			if submatch[1] != "ap-singapore-1" {
+				t.Fatalf("oracle endpoint parse failed")
+			}
+		} else {
+			t.Fatalf("oracle endpoint parse failed")
+		}
+	} else {
+		t.Fatalf("oracle endpoint parse failed")
+	}
+}
+
+func TestOVHCompileRegexp(t *testing.T) {
+	for _, ep := range []string{"s3.gra.cloud.ovh.net", "s3.gra.perf.cloud.ovh.net", "s3.gra.io.cloud.ovh.net"} {
+		ovhCompile := regexp.MustCompile(OVHCompileRegexp)
+		if ovhCompile.MatchString(ep) {
+			if submatch := ovhCompile.FindStringSubmatch(ep); len(submatch) >= 2 {
+				if submatch[1] != "gra" {
+					t.Fatalf("ovh endpoint parse failed")
+				}
+			} else {
+				t.Fatalf("ovh endpoint parse failed")
+			}
+		} else {
+			t.Fatalf("ovh endpoint parse failed")
+		}
+	}
 }
 
 func TestOSS(t *testing.T) {
@@ -363,7 +473,7 @@ func TestAzure(t *testing.T) {
 		t.SkipNow()
 	}
 	//https://containersName.core.windows.net
-	abs, _ := newWabs(os.Getenv("AZURE_ENDPOINT"),
+	abs, _ := newWasb(os.Getenv("AZURE_ENDPOINT"),
 		os.Getenv("AZURE_STORAGE_ACCOUNT"), os.Getenv("AZURE_STORAGE_KEY"), "")
 	testStorage(t, abs)
 }
@@ -527,7 +637,7 @@ func TestEncrypted(t *testing.T) {
 	s, _ := CreateStorage("mem", "", "", "", "")
 	privkey, _ := rsa.GenerateKey(rand.Reader, 2048)
 	kc := NewRSAEncryptor(privkey)
-	dc := NewAESEncryptor(kc)
+	dc, _ := NewDataEncryptor(kc, AES256GCM_RSA)
 	es := NewEncrypted(s, dc)
 	testStorage(t, es)
 }
@@ -587,6 +697,12 @@ func TestPG(t *testing.T) {
 	}
 	testStorage(t, s)
 
+}
+func TestPGWithSearchPath(t *testing.T) {
+	_, err := newSQLStore("postgres", "localhost:5432/test?sslmode=disable&search_path=juicefs,public", "", "")
+	if !strings.Contains(err.Error(), "currently, only one schema is supported in search_path") {
+		t.Fatalf("TestPGWithSearchPath error: %s", err)
+	}
 }
 
 func TestMySQL(t *testing.T) {
@@ -655,6 +771,17 @@ func TestIBMCOS(t *testing.T) {
 	}
 	s, _ := newIBMCOS(os.Getenv("IBMCOS_ENDPOINT"), os.Getenv("IBMCOS_ACCESS_KEY"), os.Getenv("IBMCOS_SECRET_KEY"), "")
 	testStorage(t, s)
+}
+
+func TestTOS(t *testing.T) {
+	if os.Getenv("TOS_ENDPOINT") == "" {
+		t.SkipNow()
+	}
+	tos, err := newTOS(os.Getenv("TOS_ENDPOINT"), os.Getenv("TOS_ACCESS_KEY"), os.Getenv("TOS_SECRET_KEY"), "")
+	if err != nil {
+		t.Fatalf("create: %s", err)
+	}
+	testStorage(t, tos)
 }
 
 func TestMain(m *testing.M) {

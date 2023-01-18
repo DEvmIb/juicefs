@@ -44,7 +44,7 @@ func globalFlags() []cli.Flag {
 		},
 		&cli.BoolFlag{
 			Name:  "no-agent",
-			Usage: "disable pprof (:6060) and gops (:6070) agent",
+			Usage: "disable pprof (:6060) agent",
 		},
 		&cli.StringFlag{
 			Name:  "pyroscope",
@@ -106,7 +106,7 @@ func clientFlags() []cli.Flag {
 		},
 		&cli.IntFlag{
 			Name:  "max-deletes",
-			Value: 2,
+			Value: 10,
 			Usage: "number of threads to delete objects",
 		},
 		&cli.IntFlag{
@@ -144,10 +144,15 @@ func clientFlags() []cli.Flag {
 			Value: defaultCacheDir,
 			Usage: "directory paths of local cache, use colon to separate multiple paths",
 		},
+		&cli.StringFlag{
+			Name:  "cache-mode",
+			Value: "0600", // only owner can read/write cache
+			Usage: "file permissions for cached blocks",
+		},
 		&cli.IntFlag{
 			Name:  "cache-size",
 			Value: 100 << 10,
-			Usage: "size of cached objects in MiB",
+			Usage: "size of cached object for read in MiB",
 		},
 		&cli.Float64Flag{
 			Name:  "free-space-ratio",
@@ -157,6 +162,16 @@ func clientFlags() []cli.Flag {
 		&cli.BoolFlag{
 			Name:  "cache-partial-only",
 			Usage: "cache only random/small read",
+		},
+		&cli.StringFlag{
+			Name:  "verify-cache-checksum",
+			Value: "full",
+			Usage: "checksum level (none, full, shrink, extend)",
+		},
+		&cli.StringFlag{
+			Name:  "cache-scan-interval",
+			Value: "3600",
+			Usage: "interval (in seconds) to scan cache-dir to rebuild in-memory index",
 		},
 		&cli.StringFlag{
 			Name:  "backup-meta",

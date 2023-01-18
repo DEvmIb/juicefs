@@ -93,7 +93,11 @@ func (b *wasb) Delete(key string) error {
 	return err
 }
 
-func (b *wasb) List(prefix, marker string, limit int64) ([]Object, error) {
+func (b *wasb) List(prefix, marker, delimiter string, limit int64) ([]Object, error) {
+	if delimiter != "" {
+		return nil, notSupportedDelimiter
+	}
+	// todo
 	if marker != "" {
 		if b.marker == "" {
 			// last page
@@ -156,7 +160,7 @@ func autoWasbEndpoint(containerName, accountName, scheme string, credential *azb
 	return endpoint, nil
 }
 
-func newWabs(endpoint, accountName, accountKey, token string) (ObjectStorage, error) {
+func newWasb(endpoint, accountName, accountKey, token string) (ObjectStorage, error) {
 	if !strings.Contains(endpoint, "://") {
 		endpoint = fmt.Sprintf("https://%s", endpoint)
 	}
@@ -198,5 +202,5 @@ func newWabs(endpoint, accountName, accountKey, token string) (ObjectStorage, er
 }
 
 func init() {
-	Register("wasb", newWabs)
+	Register("wasb", newWasb)
 }

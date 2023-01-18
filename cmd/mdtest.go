@@ -1,3 +1,19 @@
+/*
+ * JuiceFS, Copyright 2022 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package cmd
 
 import (
@@ -19,7 +35,7 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-var ctx = meta.Background
+var ctx = meta.NewContext(1, uint32(os.Getuid()), []uint32{uint32(os.Getgid())})
 
 func createDir(jfs *fs.FileSystem, root string, d int, width int) error {
 	if err := jfs.Mkdir(ctx, root, 0755); err != 0 {
@@ -46,15 +62,15 @@ func createFile(jfs *fs.FileSystem, bar *utils.Bar, np int, root string, d int, 
 		}
 		if bytes > 0 {
 			for indx := 0; indx*meta.ChunkSize < bytes; indx++ {
-				var chunkid uint64
-				if st := m.NewChunk(ctx, &chunkid); st != 0 {
+				var id uint64
+				if st := m.NewSlice(ctx, &id); st != 0 {
 					return fmt.Errorf("writechunk %s: %s", fn, st)
 				}
 				size := meta.ChunkSize
 				if bytes < (indx+1)*meta.ChunkSize {
 					size = bytes - indx*meta.ChunkSize
 				}
-				if st := m.Write(ctx, f.Inode(), uint32(indx), 0, meta.Slice{Chunkid: chunkid, Size: uint32(size), Len: uint32(size)}); st != 0 {
+				if st := m.Write(ctx, f.Inode(), uint32(indx), 0, meta.Slice{Id: id, Size: uint32(size), Len: uint32(size)}); st != 0 {
 					return fmt.Errorf("writeend %s: %s", fn, st)
 				}
 			}
@@ -81,7 +97,7 @@ func createFile(jfs *fs.FileSystem, bar *utils.Bar, np int, root string, d int, 
 }
 
 func runTest(jfs *fs.FileSystem, rootDir string, np, width, depth, files, bytes int) {
-	dirs := 0
+	dirs := 1
 	w := width
 	z := depth
 	for z > 0 {
@@ -94,7 +110,6 @@ func runTest(jfs *fs.FileSystem, rootDir string, np, width, depth, files, bytes 
 	bar := progress.AddCountBar("create file", int64(total))
 	logger.Infof("Create %d files in %d dirs", total, dirs)
 
-	ctx = meta.NewContext(1, uint32(os.Getuid()), []uint32{uint32(os.Getgid())})
 	start := time.Now()
 	if err := jfs.Mkdir(ctx, rootDir, 0755); err != 0 {
 		logger.Errorf("mkdir %s: %s", rootDir, err)
@@ -187,14 +202,12 @@ func initForMdtest(c *cli.Context, mp string, metaUrl string) *fs.FileSystem {
 	if err != nil {
 		logger.Fatalf("load setting: %s", err)
 	}
-	registerer, registry := wrapRegister(mp, format.Name)
-	if !c.Bool("writeback") && c.IsSet("upload-delay") {
-		logger.Warnf("delayed upload only work in writeback mode")
+	if st := m.Chroot(meta.Background, metaConf.Subdir); st != 0 {
+		logger.Fatalf("Chroot to %s: %s", metaConf.Subdir, st)
 	}
+	registerer, registry := wrapRegister(mp, format.Name)
 
-	blob, err := NewReloadableStorage(format, func() (*meta.Format, error) {
-		return getFormat(c, m)
-	})
+	blob, err := NewReloadableStorage(format, m, updateFormat(c))
 	if err != nil {
 		logger.Fatalf("object storage: %s", err)
 	}

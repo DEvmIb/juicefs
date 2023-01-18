@@ -1,9 +1,8 @@
 ---
-sidebar_label: Use JuiceFS on Tencent Cloud
+title: Use JuiceFS on Tencent Cloud
 sidebar_position: 7
 slug: /clouds/qcloud
 ---
-# Use JuiceFS on Tencent Cloud
 
 JuiceFS needs to be used with database and object storage together. Here we directly use Tencent Cloud's CVM cloud server, combined with cloud database and COS object storage.
 
@@ -37,7 +36,7 @@ JuiceFS will store all the metadata corresponding to the data in a separate data
 
 Depending on the database type, the performance and reliability of metadata varies. For example, Redis runs entirely on memory, which provides the ultimate performance, but is difficult to operate and maintain, and has relatively low reliability. SQLite is a single-file relational database with low performance and is not suitable for large-scale data storage, but it is configuration-free and suitable for scenarios with small amounts of data storage.
 
-If you are just evaluating the capabilities of JuiceFS, you can manually build the database for use in the CVM. When you want to use JucieFS in a production environment, the cloud database service of Tencent Cloud is usually a better choice if you don't have a professional database operation and maintenance team.
+If you are just evaluating the capabilities of JuiceFS, you can manually build the database for use in the CVM. When you want to use JuiceFS in a production environment, the cloud database service of Tencent Cloud is usually a better choice if you don't have a professional database operation and maintenance team.
 
 Of course, you can also use cloud database services provided on other cloud platforms if you wish.However, in this case, you can only access the cloud database through the public network, which means that you must expose the database port to the public network, which has some security risks and requires special attention.
 
@@ -49,8 +48,6 @@ If you must access the database through the public network, you can enhance the 
 | **Management**  |                          High                           |                            Medium                            |                             Low                              |
 | **Reliability** |                           Low                           |                            Medium                            |                             Low                              |
 |  **Scenario**   | Massive data, distributed high-frequency read and write | Massive data, distributed low and medium frequency read and write | Low frequency read and write in single machine for small amount of data |
-
-> **Note**: If you use [JuiceFS Hosted Service](https://juicefs.com/docs/en/hosted_service.html), you do not need to prepare a database.
 
 **This article uses the TencentDB for Redis, which is accessed through a VPC private network interacting with the CVM:**
 
@@ -83,23 +80,23 @@ Tencent Cloud COS needs to be accessed through API, you need to prepare the acce
 Here we are using Ubuntu Server 20.04 64-bit system, and the latest version of the client can be downloaded by running the following commands. You can also choose another version by visiting the [JuiceFS GitHub Releases](https://github.com/juicedata/juicefs/releases) page.
 
 ```shell
-$ JFS_LATEST_TAG=$(curl -s https://api.github.com/repos/juicedata/juicefs/releases/latest | grep 'tag_name' | cut -d '"' -f 4 | tr -d 'v')
+JFS_LATEST_TAG=$(curl -s https://api.github.com/repos/juicedata/juicefs/releases/latest | grep 'tag_name' | cut -d '"' -f 4 | tr -d 'v')
 ```
 
 ```shell
-$ wget "https://github.com/juicedata/juicefs/releases/download/v${JFS_LATEST_TAG}/juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz"
+wget "https://github.com/juicedata/juicefs/releases/download/v${JFS_LATEST_TAG}/juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz"
 ```
 
 After downloading, unzip the program into the `juice` folder.
 
 ```shell
-$ mkdir juice && tar -zxvf "juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz" -C juice
+mkdir juice && tar -zxvf "juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz" -C juice
 ```
 
 Install the JuiceFS client to `/usr/local/bin` :
 
 ```shell
-$ sudo install juice/juicefs /usr/local/bin
+sudo install juice/juicefs /usr/local/bin
 ```
 
 Execute the command and see the help message `juicefs` returned, which means the client installation is successful.
@@ -137,7 +134,7 @@ GLOBAL OPTIONS:
    --verbose, --debug, -v  enable debug log (default: false)
    --quiet, -q             only warning and errors (default: false)
    --trace                 enable trace log (default: false)
-   --no-agent              Disable pprof (:6060) and gops (:6070) agent (default: false)
+   --no-agent              disable pprof (:6060) agent (default: false)
    --help, -h              show help (default: false)
    --version, -V           print only the version (default: false)
 
@@ -157,12 +154,12 @@ The following command creates a storage called `mystor`, i.e., a file system, us
 
 ```shell
 $ juicefs format \
-	--storage cos \
-	--bucket https://<your-bucket-name> \
-	--access-key <your-access-key-id> \
-	--secret-key <your-access-key-secret> \
-	redis://:<your-redis-password>@192.168.5.5:6379/1 \
-	mystor
+    --storage cos \
+    --bucket https://<your-bucket-name> \
+    --access-key <your-access-key-id> \
+    --secret-key <your-access-key-secret> \
+    redis://:<your-redis-password>@192.168.5.5:6379/1 \
+    mystor
 ```
 
 **Option description:**
@@ -190,7 +187,7 @@ When the file system is created, the information related to the object storage i
 Use the `mount` subcommand to mount the file system to the `/mnt/jfs` directory.
 
 ```shell
-$ sudo juicefs mount -d redis://:<your-redis-password>@192.168.5.5:6379/1 /mnt/jfs
+sudo juicefs mount -d redis://:<your-redis-password>@192.168.5.5:6379/1 /mnt/jfs
 ```
 
 > **Note**: When mounting the file system, only the Redis database address is required, not the file system name. The default cache path is `/var/jfsCache`, please make sure the current user has enough read/write permissions.
@@ -268,7 +265,7 @@ $ juicefs status redis://:<your-redis-password>@192.168.5.5:6379/1
 The file system can be unmounted using the `umount` command provided by the JuiceFS client, e.g.
 
 ```shell
-$ sudo juicefs umount /mnt/jfs
+sudo juicefs umount /mnt/jfs
 ```
 
 > **Note**: Forced unmount of the file system in use may result in data corruption or loss, so please be sure to proceed with caution.
@@ -280,7 +277,7 @@ If you don't want to manually remount JuiceFS storage on reboot, you can set up 
 First, you need to rename the `juicefs` client to `mount.juicefs` and copy it to the `/sbin/` directory.
 
 ```shell
-$ sudo cp juice/juicefs /sbin/mount.juicefs
+sudo cp juice/juicefs /sbin/mount.juicefs
 ```
 
 Edit the `/etc/fstab` configuration file and add a new record.

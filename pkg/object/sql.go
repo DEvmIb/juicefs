@@ -26,12 +26,13 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	_ "github.com/lib/pq"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/sirupsen/logrus"
 	"xorm.io/xorm"
@@ -54,7 +55,11 @@ type blob struct {
 }
 
 func (s *sqlStore) String() string {
-	return fmt.Sprintf("%s://%s/", s.db.DriverName(), s.addr)
+	driver := s.db.DriverName()
+	if driver == "pgx" {
+		driver = "postgres"
+	}
+	return fmt.Sprintf("%s://%s/", driver, s.addr)
 }
 
 func (s *sqlStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
@@ -85,7 +90,7 @@ func (s *sqlStore) Put(key string, in io.Reader) error {
 	var n int64
 	now := time.Now()
 	b := blob{Key: key, Data: d, Size: int64(len(d)), Modified: now}
-	if s.db.DriverName() == "postgres" {
+	if name := s.db.DriverName(); name == "postgres" || name == "pgx" {
 		var r sql.Result
 		r, err = s.db.Exec("INSERT INTO jfs_blob(key, size,modified, data) VALUES(?, ?, ?,? ) "+
 			"ON CONFLICT (key) DO UPDATE SET size=?,data=?", key, b.Size, now, d, b.Size, d)
@@ -126,9 +131,13 @@ func (s *sqlStore) Delete(key string) error {
 	return err
 }
 
-func (s *sqlStore) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *sqlStore) List(prefix, marker, delimiter string, limit int64) ([]Object, error) {
 	if marker == "" {
 		marker = prefix
+	}
+	// todo
+	if delimiter != "" {
+		return nil, notSupportedDelimiter
 	}
 	var bs []blob
 	err := s.db.Where("`key` >= ?", marker).Limit(int(limit)).Cols("`key`", "size", "modified").OrderBy("`key`").Find(&bs)
@@ -157,8 +166,21 @@ func newSQLStore(driver, addr, user, password string) (ObjectStorage, error) {
 	if user != "" {
 		uri = user + ":" + password + "@" + addr
 	}
+	var searchPath string
 	if driver == "postgres" {
 		uri = "postgres://" + uri
+		driver = "pgx"
+
+		parse, err := url.Parse(addr)
+		if err != nil {
+			return nil, fmt.Errorf("parse url %s failed: %s", addr, err)
+		}
+		searchPath = parse.Query().Get("search_path")
+		if searchPath != "" {
+			if len(strings.Split(searchPath, ",")) > 1 {
+				return nil, fmt.Errorf("currently, only one schema is supported in search_path")
+			}
+		}
 	}
 	engine, err := xorm.NewEngine(driver, uri)
 	if err != nil {
@@ -176,6 +198,9 @@ func newSQLStore(driver, addr, user, password string) (ObjectStorage, error) {
 	default:
 		engine.SetLogLevel(log.LOG_OFF)
 	}
+	if searchPath != "" {
+		engine.SetSchema(searchPath)
+	}
 	engine.SetTableMapper(names.NewPrefixMapper(engine.GetTableMapper(), "jfs_"))
 	if err := engine.Sync2(new(blob)); err != nil {
 		return nil, fmt.Errorf("create table blob: %s", err)
@@ -183,22 +208,22 @@ func newSQLStore(driver, addr, user, password string) (ObjectStorage, error) {
 	return &sqlStore{DefaultObjectStorage{}, engine, addr}, nil
 }
 
+func removeScheme(addr string) string {
+	p := strings.Index(addr, "://")
+	if p > 0 {
+		addr = addr[p+3:]
+	}
+	return addr
+}
+
 func init() {
 	Register("sqlite3", func(addr, user, pass, token string) (ObjectStorage, error) {
-		p := strings.Index(addr, "://")
-		if p > 0 {
-			addr = addr[p+3:]
-		}
-		return newSQLStore("sqlite3", addr, user, pass)
+		return newSQLStore("sqlite3", removeScheme(addr), user, pass)
 	})
 	Register("mysql", func(addr, user, pass, token string) (ObjectStorage, error) {
-		p := strings.Index(addr, "://")
-		if p > 0 {
-			addr = addr[p+3:]
-		}
-		return newSQLStore("mysql", addr, user, pass)
+		return newSQLStore("mysql", removeScheme(addr), user, pass)
 	})
 	Register("postgres", func(addr, user, pass, token string) (ObjectStorage, error) {
-		return newSQLStore("postgres", addr, user, pass)
+		return newSQLStore("postgres", removeScheme(addr), user, pass)
 	})
 }

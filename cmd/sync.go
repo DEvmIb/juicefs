@@ -41,7 +41,7 @@ func cmdSync() *cli.Command {
 		ArgsUsage: "SRC DST",
 		Description: `
 This tool spawns multiple threads to concurrently syncs objects of two data storages.
-SRC and DST should be [NAME://][ACCESS_KEY:SECRET_KEY@]BUCKET[.ENDPOINT][/PREFIX].
+SRC and DST should be [NAME://][ACCESS_KEY:SECRET_KEY[:TOKEN]@]BUCKET[.ENDPOINT][/PREFIX].
 
 Include/exclude pattern rules:
 The include/exclude rules each specify a pattern that is matched against the names of the files that are going to be transferred.  These patterns can take several forms:
@@ -59,8 +59,7 @@ Examples:
 $ juicefs sync oss://mybucket.oss-cn-shanghai.aliyuncs.com s3://mybucket.s3.us-east-2.amazonaws.com
 
 # Sync objects from S3 to JuiceFS
-$ juicefs mount -d redis://localhost /mnt/jfs
-$ juicefs sync s3://mybucket.s3.us-east-2.amazonaws.com/ /mnt/jfs/
+$ myfs=redis://localhost juicefs sync s3://mybucket.s3.us-east-2.amazonaws.com/ jfs://myfs/ -p 50
 
 # SRC: a1/b1,a2/b2,aaa/b1   DST: empty   sync result: aaa/b1
 $ juicefs sync --exclude='a?/b*' s3://mybucket.s3.us-east-2.amazonaws.com/ /mnt/jfs/
@@ -142,7 +141,7 @@ Supported storage systems: https://juicefs.com/docs/community/how_to_setup_objec
 			},
 			&cli.Int64Flag{
 				Name:  "limit",
-				Usage: "limit the number of objects that will be processed",
+				Usage: "limit the number of objects that will be processed (-1 is unlimited, 0 is to process nothing)",
 				Value: -1,
 			},
 			&cli.StringFlag{
@@ -203,6 +202,13 @@ func isFilePath(uri string) bool {
 	return !strings.Contains(uri, ":")
 }
 
+func extractToken(uri string) (string, string) {
+	if submatch := regexp.MustCompile(`^.*:.*:.*(:.*)@.*$`).FindStringSubmatch(uri); len(submatch) == 2 {
+		return strings.ReplaceAll(uri, submatch[1], ""), strings.TrimLeft(submatch[1], ":")
+	}
+	return uri, ""
+}
+
 func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, error) {
 	if !strings.Contains(uri, "://") {
 		if isFilePath(uri) {
@@ -235,6 +241,7 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 			return object.CreateStorage("sftp", uri, user, pass, "")
 		}
 	}
+	uri, token := extractToken(uri)
 	u, err := url.Parse(uri)
 	if err != nil {
 		logger.Fatalf("Can't parse %s: %s", uri, err.Error())
@@ -246,28 +253,34 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 		secretKey, _ = user.Password()
 	}
 	name := strings.ToLower(u.Scheme)
-	endpoint := u.Host
 	if conf.Links && name != "file" {
 		logger.Warnf("storage %s does not support symlink, ignore it", uri)
 		conf.Links = false
 	}
 
-	isS3PathTypeUrl := isS3PathType(endpoint)
-
+	var endpoint string
 	if name == "file" {
 		endpoint = u.Path
 	} else if name == "hdfs" {
-	} else if !conf.NoHTTPS && supportHTTPS(name, endpoint) {
-		endpoint = "https://" + endpoint
+		endpoint = u.Host
+	} else if name == "jfs" {
+		endpoint, err = url.PathUnescape(u.Host)
+		if err != nil {
+			return nil, fmt.Errorf("unescape %s: %s", u.Host, err)
+		}
+	} else if !conf.NoHTTPS && supportHTTPS(name, u.Host) {
+		endpoint = "https://" + u.Host
 	} else {
-		endpoint = "http://" + endpoint
+		endpoint = "http://" + u.Host
 	}
+
+	isS3PathTypeUrl := isS3PathType(u.Host)
 	if name == "minio" || name == "s3" && isS3PathTypeUrl {
 		// bucket name is part of path
 		endpoint += u.Path
 	}
 
-	store, err := object.CreateStorage(name, endpoint, accessKey, secretKey, "")
+	store, err := object.CreateStorage(name, endpoint, accessKey, secretKey, token)
 	if err != nil {
 		return nil, fmt.Errorf("create %s %s: %s", name, endpoint, err)
 	}
@@ -313,8 +326,16 @@ func doSync(c *cli.Context) error {
 	go func() { _ = http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", config.HTTPPort), nil) }()
 
 	// Windows support `\` and `/` as its separator, Unix only use `/`
-	srcURL := strings.Replace(c.Args().Get(0), "\\", "/", -1)
-	dstURL := strings.Replace(c.Args().Get(1), "\\", "/", -1)
+	srcURL := c.Args().Get(0)
+	dstURL := c.Args().Get(1)
+	if runtime.GOOS == "windows" {
+		if !strings.Contains(srcURL, "://") {
+			srcURL = strings.Replace(srcURL, "\\", "/", -1)
+		}
+		if !strings.Contains(dstURL, "://") {
+			dstURL = strings.Replace(dstURL, "\\", "/", -1)
+		}
+	}
 	if strings.HasSuffix(srcURL, "/") != strings.HasSuffix(dstURL, "/") {
 		logger.Fatalf("SRC and DST should both end with path separator or not!")
 	}

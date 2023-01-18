@@ -30,6 +30,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/vfs"
 )
 
+//mutate_test_job_number: 5
 func TestFileStat(t *testing.T) {
 	attr := meta.Attr{
 		Typ:   meta.TypeDirectory,
@@ -169,8 +170,11 @@ func TestFileSystem(t *testing.T) {
 	if target, e := fs.Readlink(ctx, "/sym"); e != 0 || string(target) != "hello" {
 		t.Fatalf("readlink: %s", string(target))
 	}
-	if fi, err := fs.Stat(ctx, "/sym"); err != 0 || fi.name != "sym" {
+	if fi, err := fs.Stat(ctx, "/sym"); err != 0 || fi.name != "sym" || fi.IsSymlink() {
 		t.Fatalf("stat symlink: %s %+v", err, fi)
+	}
+	if fi, err := fs.Lstat(ctx, "/sym"); err != 0 || fi.name != "sym" || !fi.IsSymlink() {
+		t.Fatalf("lstat symlink: %s %+v", err, fi)
 	}
 	if err := fs.Delete(ctx, "/sym"); err != 0 {
 		t.Fatalf("delete /sym: %s", err)
@@ -269,7 +273,7 @@ func createTestFS(t *testing.T) *FileSystem {
 	checkAccessFile = time.Millisecond
 	rotateAccessLog = 500
 	m := meta.NewClient("memkv://", &meta.Config{})
-	format := meta.Format{
+	format := &meta.Format{
 		Name:      "test",
 		BlockSize: 4096,
 		Capacity:  1 << 30,
@@ -292,7 +296,7 @@ func createTestFS(t *testing.T) *FileSystem {
 	store := chunk.NewCachedStore(objStore, *conf.Chunk, nil)
 	jfs, err := NewFileSystem(&conf, m, store)
 	if err != nil {
-		t.Fatalf("initialize failed: %s", err)
+		t.Fatalf("initialize  failed: %s", err)
 	}
 	return jfs
 }

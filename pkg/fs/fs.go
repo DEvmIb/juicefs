@@ -406,6 +406,13 @@ func (fs *FileSystem) Stat(ctx meta.Context, path string) (fi *FileStat, err sys
 	defer trace.StartRegion(context.TODO(), "fs.Stat").End()
 	l := vfs.NewLogContext(ctx)
 	defer func() { fs.log(l, "Stat (%s): %s", path, errstr(err)) }()
+	return fs.resolve(ctx, path, true)
+}
+
+func (fs *FileSystem) Lstat(ctx meta.Context, path string) (fi *FileStat, err syscall.Errno) {
+	defer trace.StartRegion(context.TODO(), "fs.Lstat").End()
+	l := vfs.NewLogContext(ctx)
+	defer func() { fs.log(l, "Lstat (%s): %s", path, errstr(err)) }()
 	return fs.resolve(ctx, path, false)
 }
 
@@ -433,6 +440,18 @@ func (fs *FileSystem) Mkdir(ctx meta.Context, p string, mode uint16) (err syscal
 	err = fs.m.Mkdir(ctx, fi.inode, path.Base(p), mode, 0, 0, &inode, nil)
 	fs.invalidateEntry(fi.inode, path.Base(p))
 	return
+}
+
+func (fs *FileSystem) MkdirAll(ctx meta.Context, p string, mode uint16) (err syscall.Errno) {
+	err = fs.Mkdir(ctx, p, mode)
+	if err == syscall.ENOENT {
+		_ = fs.MkdirAll(ctx, parentDir(p), mode)
+		err = fs.Mkdir(ctx, p, mode)
+	}
+	if err == syscall.EEXIST {
+		err = 0
+	}
+	return err
 }
 
 func (fs *FileSystem) Delete(ctx meta.Context, p string) (err syscall.Errno) {
@@ -716,6 +735,10 @@ func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool
 			p = strings.TrimRight(p, "/")
 			ss := strings.Split(p, "/")
 			fi.name = ss[len(ss)-1]
+			if fi.IsSymlink() && followLastSymlink {
+				// fast resolve can't follow symlink
+				err = syscall.ENOTSUP
+			}
 		}
 		if err != syscall.ENOTSUP {
 			return
@@ -737,6 +760,9 @@ func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool
 			break
 		}
 		if i > 0 {
+			if (name == "." || name == "..") && attr.Typ != meta.TypeDirectory {
+				return nil, syscall.ENOTDIR
+			}
 			if err := fs.m.Access(ctx, parent, mMaskX, attr); err != 0 {
 				return nil, err
 			}
@@ -753,7 +779,6 @@ func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool
 			return
 		}
 		fi = AttrToFileInfo(inode, attr)
-		fi.name = name
 		if (!resolved || followLastSymlink) && fi.IsSymlink() {
 			var buf []byte
 			err = fs.m.ReadLink(ctx, inode, &buf)
@@ -772,6 +797,7 @@ func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool
 			inode = fi.Inode()
 			attr = fi.attr
 		}
+		fi.name = name
 		parent = inode
 	}
 	if parent == meta.RootInode {
@@ -925,6 +951,7 @@ func (f *File) Utime(ctx meta.Context, atime, mtime int64) (err syscall.Errno) {
 	attr.Mtime = mtime / 1000
 	attr.Mtimensec = uint32(mtime%1000) * 1e6
 	err = f.fs.m.SetAttr(ctx, f.inode, flag, 0, &attr)
+	f.fs.invalidateAttr(f.inode)
 	return
 }
 

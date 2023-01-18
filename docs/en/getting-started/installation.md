@@ -1,14 +1,22 @@
 ---
-sidebar_label: Installation & Upgrade
+title: Installation
 sidebar_position: 1
 slug: /installation
+pagination_prev: introduction/comparison/juicefs_vs_s3ql
+description: This article describes how to install JuiceFS on Linux, macOS and Windows, including one-click installation, compiled and containerized.
 ---
-
-# Installation & Upgrade
 
 JuiceFS has good cross-platform capability and supports running on all kinds of operating systems of almost all major architectures, including and not limited to Linux, macOS, Windows, etc.
 
 The JuiceFS client has only one binary file, you can download the pre-compiled version to unzip it and use it directly, or you can compile it manually with the source code.
+
+## One-Click Installation
+
+The one-click installation script is available for Linux and macOS systems and will automatically download and install the latest version of the JuiceFS client based on your hardware architecture.
+
+```shell
+curl -sSL https://d.juicefs.com/install | sh -
+```
 
 ## Install the pre-compiled client
 
@@ -62,7 +70,7 @@ If the terminal prompts `command not found`, it is probably because `/usr/local/
 There are two ways to use JuiceFS on Windows systems.
 
 1. [Using pre-compiled Windows client](#pre-compiled-windows-client)
-2. [Using Linux client in WSL](#using-the-linux-client-in-wsl)
+2. [Using Linux client in WSL](#using-linux-client-in-wsl)
 
 #### Pre-compiled Windows client
 
@@ -92,7 +100,7 @@ For details, see "[Using JuiceFS on WSL](../tutorials/juicefs_on_wsl.md)"
 
 ### macOS
 
-Since macOS does not support the FUSE interface by default, you need to install [macFUSE](https://osxfuse.github.io/) first to implement the support for FUSE.
+Since macOS does not support the FUSE interface by default, you need to install [macFUSE](https://osxfuse.github.io) first to implement the support for FUSE.
 
 :::tip
 [macFUSE](https://github.com/osxfuse/osxfuse) is an open source file system enhancement tool that allows macOS to mount third-party file systems, enabling JuiceFS clients to mount file systems on macOS systems.
@@ -100,7 +108,7 @@ Since macOS does not support the FUSE interface by default, you need to install 
 
 #### Homebrew
 
-If you have the [Homebrew](https://brew.sh/) package manager installed on your system, you can install the JuiceFS client by executing the following command.
+If you have the [Homebrew](https://brew.sh) package manager installed on your system, you can install the JuiceFS client by executing the following command.
 
 ```shell
 brew tap juicedata/homebrew-tap
@@ -157,7 +165,7 @@ For users in China, in order to speed up the acquisition of Go modules, it is re
 
 Compiling clients for Linux, macOS, BSD and other Unix-like systems requires the following dependencies:
 
-- [Go](https://golang.org) 1.17+
+- [Go](https://golang.org) 1.18+
 - GCC 5.4+
 
 1. Clone source code
@@ -174,10 +182,10 @@ Compiling clients for Linux, macOS, BSD and other Unix-like systems requires the
 
 3. Switching the branch
 
-   The source code uses the `main` branch by default, and you can switch to any official release, for example to the release `v1.0.0-beta2`:
+   The source code uses the `main` branch by default, and you can switch to any official release, for example to the release `v1.0.0`:
 
    ```shell
-   git checkout v1.0.0-beta2
+   git checkout v1.0.0
    ```
 
    :::caution
@@ -194,9 +202,9 @@ Compiling clients for Linux, macOS, BSD and other Unix-like systems requires the
 
 ### Compiling on Windows
 
-Compiling the JuiceFS client on Windows requires [Go](https://golang.org) 1.17+ and GCC 5.4+.
+Compiling the JuiceFS client on Windows requires [Go](https://golang.org) 1.18+ and GCC 5.4+.
 
-Since GCC does not have a native Windows client, the version provided by a third party, either [MinGW-w64](https://sourceforge.net/projects/mingw-w64/) or [Cygwin](https://www.cygwin.com/) is needed. Here is an example of using MinGW-w64.
+Since GCC does not have a native Windows client, the version provided by a third party, either [MinGW-w64](https://sourceforge.net/projects/mingw-w64) or [Cygwin](https://www.cygwin.com) is needed. Here is an example of using MinGW-w64.
 
 Download MinGW-w64 and add its `bin` directory to the system environment variables.
 
@@ -273,17 +281,6 @@ The compiled client is a binary file named `juicefs.exe`, located in the current
    ```shell
    make juicefs.linux
    ```
-
-## Upgrade
-
-The JuiceFS client only has one binary file, so to upgrade the new version, you only need to replace the old one with the new one.
-
-- **Use pre-compiled client**: You can refer to the installation method of the corresponding system in this document, download the latest client, and overwrite the old one.
-- **Manually compile client**: You can pull the latest source code and recompile it to overwrite the old version of the client.
-
-:::caution
-For the file system that has been mounted using the old version of JuiceFS client, you need to [unmount file system](for_distributed.md#6-unmounting-the-file-system), and then re-mount it with the new version of JuiceFS client.
-:::
 
 ## Uninstall
 

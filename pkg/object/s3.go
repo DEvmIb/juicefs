@@ -28,7 +28,9 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -67,7 +69,7 @@ func isExists(err error) bool {
 }
 
 func (s *s3client) Create() error {
-	if _, err := s.List("", "", 1); err == nil {
+	if _, err := s.List("", "", "", 1); err == nil {
 		return nil
 	}
 	_, err := s.s3.CreateBucket(&s3.CreateBucketInput{Bucket: &s.bucket})
@@ -162,18 +164,19 @@ func (s *s3client) Delete(key string) error {
 		Key:    &key,
 	}
 	_, err := s.s3.DeleteObject(&param)
-	if err != nil && strings.Contains(err.Error(), "NoSuckKey") {
+	if err != nil && strings.Contains(err.Error(), "NoSuchKey") {
 		err = nil
 	}
 	return err
 }
 
-func (s *s3client) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *s3client) List(prefix, marker, delimiter string, limit int64) ([]Object, error) {
 	param := s3.ListObjectsInput{
-		Bucket:  &s.bucket,
-		Prefix:  &prefix,
-		Marker:  &marker,
-		MaxKeys: &limit,
+		Bucket:    &s.bucket,
+		Prefix:    &prefix,
+		Marker:    &marker,
+		MaxKeys:   &limit,
+		Delimiter: &delimiter,
 	}
 	resp, err := s.s3.ListObjects(&param)
 	if err != nil {
@@ -192,6 +195,12 @@ func (s *s3client) List(prefix, marker string, limit int64) ([]Object, error) {
 			*o.LastModified,
 			strings.HasSuffix(*o.Key, "/"),
 		}
+	}
+	if delimiter != "" {
+		for _, p := range resp.CommonPrefixes {
+			objs = append(objs, &obj{*p.Prefix, 0, time.Unix(0, 0), true})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
 	}
 	return objs, nil
 }
@@ -341,6 +350,9 @@ func parseRegion(endpoint string) string {
 	return region
 }
 
+var oracleCompileRegexp = `.*\.compat.objectstorage\.(.*)\.oraclecloud\.com`
+var OVHCompileRegexp = `^s3\.(\w*)(\.\w*)?\.cloud\.ovh\.net$`
+
 func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
 	if !strings.Contains(endpoint, "://") {
 		if len(strings.Split(endpoint, ".")) > 1 && !strings.HasSuffix(endpoint, ".amazonaws.com") {
@@ -408,10 +420,14 @@ func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) 
 				// compatible s3
 				bucketName = hostParts[0]
 				ep = hostParts[1]
-				oracleCompile := regexp.MustCompile(`.*\\.compat\\.objectstorage\\.(.*)\\.oraclecloud\\.com`)
-				if oracleCompile.MatchString(ep) {
-					if submatch := oracleCompile.FindStringSubmatch(ep); len(submatch) == 2 {
-						region = submatch[1]
+
+				for _, compileRegexp := range []string{oracleCompileRegexp, OVHCompileRegexp} {
+					compile := regexp.MustCompile(compileRegexp)
+					if compile.MatchString(ep) {
+						if submatch := compile.FindStringSubmatch(ep); len(submatch) >= 2 {
+							region = submatch[1]
+							break
+						}
 					}
 				}
 			}

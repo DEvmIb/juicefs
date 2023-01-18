@@ -61,7 +61,7 @@ import (
 	locked: locked$sid -> { lockf$inode or lockp$inode }
 
 	Removed files: delfiles -> [$inode:$length -> seconds]
-	Slices refs: k$chunkid_$size -> refcount
+	Slices refs: k$sliceId_$size -> refcount
 
 	Redis features:
 	  Sorted Set: 1.2+
@@ -202,23 +202,22 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	}
 	m.en = m
 	m.checkServerConfig()
-	m.root, err = lookupSubdir(m, conf.Subdir)
-	return m, err
+	return m, nil
 }
 
 func (m *redisMeta) Shutdown() error {
 	return m.rdb.Close()
 }
 
-func (m *redisMeta) doDeleteSlice(chunkid uint64, size uint32) error {
-	return m.rdb.HDel(Background, m.sliceRefs(), m.sliceKey(chunkid, size)).Err()
+func (m *redisMeta) doDeleteSlice(id uint64, size uint32) error {
+	return m.rdb.HDel(Background, m.sliceRefs(), m.sliceKey(id, size)).Err()
 }
 
 func (m *redisMeta) Name() string {
 	return "redis"
 }
 
-func (m *redisMeta) Init(format Format, force bool) error {
+func (m *redisMeta) Init(format *Format, force bool) error {
 	ctx := Background
 	body, err := m.rdb.Get(ctx, m.setting()).Bytes()
 	if err != nil && err != redis.Nil {
@@ -400,7 +399,7 @@ func (m *redisMeta) getSession(sid string, detail bool) (*Session, error) {
 				if isFlock {
 					s.Flocks = append(s.Flocks, Flock{Ino(inode), owner, v})
 				} else {
-					s.Plocks = append(s.Plocks, Plock{Ino(inode), owner, []byte(v)})
+					s.Plocks = append(s.Plocks, Plock{Ino(inode), owner, loadLocks([]byte(v))})
 				}
 			}
 		}
@@ -495,9 +494,9 @@ func (m *redisMeta) chunkKey(inode Ino, indx uint32) string {
 	return m.prefix + "c" + inode.String() + "_" + strconv.FormatInt(int64(indx), 10)
 }
 
-func (m *redisMeta) sliceKey(chunkid uint64, size uint32) string {
+func (m *redisMeta) sliceKey(id uint64, size uint32) string {
 	// inside hashset
-	return "k" + strconv.FormatUint(chunkid, 10) + "_" + strconv.FormatUint(uint64(size), 10)
+	return "k" + strconv.FormatUint(id, 10) + "_" + strconv.FormatUint(uint64(size), 10)
 }
 
 func (m *redisMeta) xattrKey(inode Ino) string {
@@ -799,9 +798,10 @@ func (m *redisMeta) Truncate(ctx Context, inode Ino, flags uint8, length uint64,
 		f.Lock()
 		defer f.Unlock()
 	}
-	defer func() { m.of.InvalidateChunk(inode, 0xFFFFFFFF) }()
+	defer func() { m.of.InvalidateChunk(inode, invalidateAllChunks) }()
 	var newSpace int64
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		newSpace = 0
 		var t Attr
 		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
 		if err != nil {
@@ -913,9 +913,10 @@ func (m *redisMeta) Fallocate(ctx Context, inode Ino, mode uint8, off uint64, si
 		f.Lock()
 		defer f.Unlock()
 	}
-	defer func() { m.of.InvalidateChunk(inode, 0xFFFFFFFF) }()
+	defer func() { m.of.InvalidateChunk(inode, invalidateAllChunks) }()
 	var newSpace int64
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		newSpace = 0
 		var t Attr
 		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
 		if err != nil {
@@ -926,6 +927,12 @@ func (m *redisMeta) Fallocate(ctx Context, inode Ino, mode uint8, off uint64, si
 			return syscall.EPIPE
 		}
 		if t.Typ != TypeFile {
+			return syscall.EPERM
+		}
+		if (t.Flags & FlagImmutable) != 0 {
+			return syscall.EPERM
+		}
+		if (t.Flags&FlagAppend) != 0 && (mode&^fallocKeepSize) != 0 {
 			return syscall.EPERM
 		}
 		length := t.Length
@@ -948,7 +955,8 @@ func (m *redisMeta) Fallocate(ctx Context, inode Ino, mode uint8, off uint64, si
 		t.Ctimensec = uint32(now.Nanosecond())
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.Set(ctx, m.inodeKey(inode), m.marshal(&t), 0)
-			if mode&(fallocZeroRange|fallocPunchHole) != 0 {
+			if mode&(fallocZeroRange|fallocPunchHole) != 0 && off < old {
+				off, size := off, size
 				if off+size > old {
 					size = old - off
 				}
@@ -978,7 +986,7 @@ func (m *redisMeta) Fallocate(ctx Context, inode Ino, mode uint8, off uint64, si
 func (m *redisMeta) SetAttr(ctx Context, inode Ino, set uint16, sugidclearmode uint8, attr *Attr) syscall.Errno {
 	defer m.timeit(time.Now())
 	inode = m.checkRoot(inode)
-	defer func() { m.of.InvalidateChunk(inode, 0xFFFFFFFE) }()
+	defer func() { m.of.InvalidateChunk(inode, invalidateAttrOnly) }()
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		var cur Attr
 		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
@@ -1032,6 +1040,10 @@ func (m *redisMeta) SetAttr(ctx Context, inode Ino, set uint16, sugidclearmode u
 		if set&SetAttrMtimeNow != 0 {
 			cur.Mtime = now.Unix()
 			cur.Mtimensec = uint32(now.Nanosecond())
+			changed = true
+		}
+		if set&SetAttrFlag != 0 {
+			cur.Flags = attr.Flags
 			changed = true
 		}
 		if !changed {
@@ -1102,6 +1114,9 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 		m.parseAttr(a, &pattr)
 		if pattr.Typ != TypeDirectory {
 			return syscall.ENOTDIR
+		}
+		if (pattr.Flags & FlagImmutable) != 0 {
+			return syscall.EPERM
 		}
 
 		buf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
@@ -1184,19 +1199,21 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 }
 
 func (m *redisMeta) doUnlink(ctx Context, parent Ino, name string) syscall.Errno {
-	var _type uint8
 	var trash, inode Ino
-	keys := []string{m.entryKey(parent), m.inodeKey(parent)}
 	if st := m.checkTrash(parent, &trash); st != 0 {
 		return st
 	}
 	if trash == 0 {
-		defer func() { m.of.InvalidateChunk(inode, 0xFFFFFFFE) }()
+		defer func() { m.of.InvalidateChunk(inode, invalidateAttrOnly) }()
 	}
+	var _type uint8
 	var opened bool
 	var attr Attr
 	var newSpace, newInode int64
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		opened = false
+		attr = Attr{}
+		newSpace, newInode = 0, 0
 		buf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
 		if err == redis.Nil && m.conf.CaseInsensi {
 			if e := m.resolveCase(ctx, parent, name); e != nil {
@@ -1224,6 +1241,9 @@ func (m *redisMeta) doUnlink(ctx Context, parent Ino, name string) syscall.Errno
 		if pattr.Typ != TypeDirectory {
 			return syscall.ENOTDIR
 		}
+		if (pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0 {
+			return syscall.EPERM
+		}
 		var updateParent bool
 		now := time.Now()
 		if !isTrash(parent) && now.Sub(time.Unix(pattr.Mtime, int64(pattr.Mtimensec))) >= minUpdateTime {
@@ -1233,12 +1253,13 @@ func (m *redisMeta) doUnlink(ctx Context, parent Ino, name string) syscall.Errno
 			pattr.Ctimensec = uint32(now.Nanosecond())
 			updateParent = true
 		}
-		attr = Attr{}
-		opened = false
 		if rs[1] != nil {
 			m.parseAttr([]byte(rs[1].(string)), &attr)
 			if ctx.Uid() != 0 && pattr.Mode&01000 != 0 && ctx.Uid() != pattr.Uid && ctx.Uid() != attr.Uid {
 				return syscall.EACCES
+			}
+			if (attr.Flags&FlagAppend) != 0 || (attr.Flags&FlagImmutable) != 0 {
+				return syscall.EPERM
 			}
 			attr.Ctime = now.Unix()
 			attr.Ctimensec = uint32(now.Nanosecond())
@@ -1302,10 +1323,10 @@ func (m *redisMeta) doUnlink(ctx Context, parent Ino, name string) syscall.Errno
 		})
 
 		return err
-	}, keys...)
+	}, m.entryKey(parent), m.inodeKey(parent))
 	if err == nil && trash == 0 {
 		if _type == TypeFile && attr.Nlink == 0 {
-			m.fileDeleted(opened, inode, attr.Length)
+			m.fileDeleted(opened, isTrash(parent), inode, attr.Length)
 		}
 		m.updateStats(newSpace, newInode)
 	}
@@ -1313,9 +1334,7 @@ func (m *redisMeta) doUnlink(ctx Context, parent Ino, name string) syscall.Errno
 }
 
 func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string) syscall.Errno {
-	var typ uint8
-	var trash, inode Ino
-	keys := []string{m.inodeKey(parent), m.entryKey(parent)}
+	var trash Ino
 	if st := m.checkTrash(parent, &trash); st != 0 {
 		return st
 	}
@@ -1331,7 +1350,7 @@ func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string) syscall.Errno 
 		if err != nil {
 			return err
 		}
-		typ, inode = m.parseEntry(buf)
+		typ, inode := m.parseEntry(buf)
 		if typ != TypeDirectory {
 			return syscall.ENOTDIR
 		}
@@ -1347,6 +1366,9 @@ func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string) syscall.Errno 
 		m.parseAttr([]byte(rs[0].(string)), &pattr)
 		if pattr.Typ != TypeDirectory {
 			return syscall.ENOTDIR
+		}
+		if (pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0 {
+			return syscall.EPERM
 		}
 		now := time.Now()
 		pattr.Nlink--
@@ -1394,7 +1416,7 @@ func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string) syscall.Errno 
 			return nil
 		})
 		return err
-	}, keys...)
+	}, m.inodeKey(parent), m.entryKey(parent))
 	if err == nil && trash == 0 {
 		m.updateStats(-align4K(0), -1)
 	}
@@ -1403,13 +1425,16 @@ func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string) syscall.Errno 
 
 func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
 	exchange := flags == RenameExchange
-	keys := []string{m.entryKey(parentSrc), m.inodeKey(parentSrc), m.entryKey(parentDst), m.inodeKey(parentDst)}
 	var opened bool
 	var trash, dino Ino
 	var dtyp uint8
 	var tattr Attr
 	var newSpace, newInode int64
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		opened = false
+		dino, dtyp = 0, 0
+		tattr = Attr{}
+		newSpace, newInode = 0, 0
 		buf, err := tx.HGet(ctx, m.entryKey(parentSrc), nameSrc).Bytes()
 		if err == redis.Nil && m.conf.CaseInsensi {
 			if e := m.resolveCase(ctx, parentSrc, nameSrc); e != nil {
@@ -1428,7 +1453,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			}
 			return nil
 		}
-		keys = []string{m.inodeKey(ino)}
+		keys := []string{m.inodeKey(ino)}
 
 		dbuf, err := tx.HGet(ctx, m.entryKey(parentDst), nameDst).Bytes()
 		if err == redis.Nil && m.conf.CaseInsensi {
@@ -1460,7 +1485,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			return err
 		}
 
-		keys := []string{m.inodeKey(parentSrc), m.inodeKey(parentDst), m.inodeKey(ino)}
+		keys = []string{m.inodeKey(parentSrc), m.inodeKey(parentDst), m.inodeKey(ino)}
 		if dino > 0 {
 			keys = append(keys, m.inodeKey(dino))
 		}
@@ -1478,17 +1503,21 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			return syscall.ENOTDIR
 		}
 		m.parseAttr([]byte(rs[2].(string)), &iattr)
+		if (sattr.Flags&FlagAppend) != 0 || (sattr.Flags&FlagImmutable) != 0 || (dattr.Flags&FlagImmutable) != 0 || (iattr.Flags&FlagAppend) != 0 || (iattr.Flags&FlagImmutable) != 0 {
+			return syscall.EPERM
+		}
 
 		var supdate, dupdate bool
 		now := time.Now()
-		tattr = Attr{}
-		opened = false
 		if dino > 0 {
 			if rs[3] == nil {
 				logger.Warnf("no attribute for inode %d (%d, %s)", dino, parentDst, nameDst)
 				trash = 0
 			}
 			m.parseAttr([]byte(rs[3].(string)), &tattr)
+			if (tattr.Flags&FlagAppend) != 0 || (tattr.Flags&FlagImmutable) != 0 {
+				return syscall.EPERM
+			}
 			tattr.Ctime = now.Unix()
 			tattr.Ctimensec = uint32(now.Nanosecond())
 			if exchange {
@@ -1522,7 +1551,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 						if dtyp == TypeFile && tattr.Nlink == 0 {
 							opened = m.of.IsOpen(dino)
 						}
-						defer func() { m.of.InvalidateChunk(dino, 0xFFFFFFFE) }()
+						defer func() { m.of.InvalidateChunk(dino, invalidateAttrOnly) }()
 					} else if tattr.Parent > 0 {
 						tattr.Parent = trash
 					}
@@ -1535,7 +1564,6 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			if exchange {
 				return syscall.ENOENT
 			}
-			dino, dtyp = 0, 0
 		}
 		if ctx.Uid() != 0 && sattr.Mode&01000 != 0 && ctx.Uid() != sattr.Uid && ctx.Uid() != iattr.Uid {
 			return syscall.EACCES
@@ -1641,10 +1669,10 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			return nil
 		})
 		return err
-	}, keys...)
+	}, m.entryKey(parentSrc), m.inodeKey(parentSrc), m.entryKey(parentDst), m.inodeKey(parentDst))
 	if err == nil && !exchange && trash == 0 {
 		if dino > 0 && dtyp == TypeFile && tattr.Nlink == 0 {
-			m.fileDeleted(opened, dino, tattr.Length)
+			m.fileDeleted(opened, false, dino, tattr.Length)
 		}
 		m.updateStats(newSpace, newInode)
 	}
@@ -1665,6 +1693,9 @@ func (m *redisMeta) doLink(ctx Context, inode, parent Ino, name string, attr *At
 		if pattr.Typ != TypeDirectory {
 			return syscall.ENOTDIR
 		}
+		if pattr.Flags&FlagImmutable != 0 {
+			return syscall.EPERM
+		}
 		var updateParent bool
 		now := time.Now()
 		if now.Sub(time.Unix(pattr.Mtime, int64(pattr.Mtimensec))) >= minUpdateTime {
@@ -1676,6 +1707,9 @@ func (m *redisMeta) doLink(ctx Context, inode, parent Ino, name string, attr *At
 		}
 		m.parseAttr([]byte(rs[1].(string)), &iattr)
 		if iattr.Typ == TypeDirectory {
+			return syscall.EPERM
+		}
+		if (iattr.Flags&FlagAppend) != 0 || (iattr.Flags&FlagImmutable) != 0 {
 			return syscall.EPERM
 		}
 		oldParent := iattr.Parent
@@ -1742,7 +1776,7 @@ func (m *redisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*En
 		return errno(err)
 	}
 
-	if plus != 0 {
+	if plus != 0 && len(*entries) != 0 {
 		fillAttr := func(es []*Entry) error {
 			var keys = make([]string, len(es))
 			for i, e := range es {
@@ -1927,19 +1961,19 @@ func (m *redisMeta) doDeleteSustainedInode(sid uint64, inode Ino) error {
 	})
 	if err == nil {
 		m.updateStats(newSpace, -1)
-		m.tryDeleteFileData(inode, attr.Length)
+		m.tryDeleteFileData(inode, attr.Length, false)
 	}
 	return err
 }
 
-func (m *redisMeta) Read(ctx Context, inode Ino, indx uint32, chunks *[]Slice) syscall.Errno {
+func (m *redisMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) syscall.Errno {
 	f := m.of.find(inode)
 	if f != nil {
 		f.RLock()
 		defer f.RUnlock()
 	}
-	if cs, ok := m.of.ReadChunk(inode, indx); ok {
-		*chunks = cs
+	if ss, ok := m.of.ReadChunk(inode, indx); ok {
+		*slices = ss
 		return 0
 	}
 	defer m.timeit(time.Now())
@@ -1948,9 +1982,12 @@ func (m *redisMeta) Read(ctx Context, inode Ino, indx uint32, chunks *[]Slice) s
 		return errno(err)
 	}
 	ss := readSlices(vals)
-	*chunks = buildSlice(ss)
-	m.of.CacheChunk(inode, indx, *chunks)
-	if !m.conf.ReadOnly && (len(vals) >= 5 || len(*chunks) >= 5) {
+	if ss == nil {
+		return syscall.EIO
+	}
+	*slices = buildSlice(ss)
+	m.of.CacheChunk(inode, indx, *slices)
+	if !m.conf.ReadOnly && (len(vals) >= 5 || len(*slices) >= 5) {
 		go m.compactChunk(inode, indx, false)
 	}
 	return 0
@@ -1967,6 +2004,7 @@ func (m *redisMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice
 	var newSpace int64
 	var needCompact bool
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		newSpace = 0
 		var attr Attr
 		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
 		if err != nil {
@@ -1992,9 +2030,9 @@ func (m *redisMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice
 
 		var rpush *redis.IntCmd
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			rpush = pipe.RPush(ctx, m.chunkKey(inode, indx), marshalSlice(off, slice.Chunkid, slice.Size, slice.Off, slice.Len))
+			rpush = pipe.RPush(ctx, m.chunkKey(inode, indx), marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len))
 			// most of chunk are used by single inode, so use that as the default (1 == not exists)
-			// pipe.Incr(ctx, r.sliceKey(slice.Chunkid, slice.Size))
+			// pipe.Incr(ctx, r.sliceKey(slice.ID, slice.Size))
 			pipe.Set(ctx, m.inodeKey(inode), m.marshal(&attr), 0)
 			if newSpace > 0 {
 				pipe.IncrBy(ctx, m.usedSpaceKey(), newSpace)
@@ -2023,8 +2061,9 @@ func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, 
 		defer f.Unlock()
 	}
 	var newSpace int64
-	defer func() { m.of.InvalidateChunk(fout, 0xFFFFFFFF) }()
+	defer func() { m.of.InvalidateChunk(fout, invalidateAllChunks) }()
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		newSpace = 0
 		rs, err := tx.MGet(ctx, m.inodeKey(fin), m.inodeKey(fout)).Result()
 		if err != nil {
 			return err
@@ -2041,6 +2080,7 @@ func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, 
 			*copied = 0
 			return nil
 		}
+		size := size
 		if offIn+size > sattr.Length {
 			size = sattr.Length - offIn
 		}
@@ -2048,6 +2088,9 @@ func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, 
 		m.parseAttr([]byte(rs[1].(string)), &attr)
 		if attr.Typ != TypeFile {
 			return syscall.EINVAL
+		}
+		if (attr.Flags&FlagImmutable) != 0 || (attr.Flags&FlagAppend) != 0 {
+			return syscall.EPERM
 		}
 
 		newleng := offOut + size
@@ -2078,7 +2121,11 @@ func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, 
 			for _, v := range vals {
 				sv := v.(*redis.StringSliceCmd).Val()
 				// Add a zero chunk for hole
-				ss := append([]*slice{{len: ChunkSize}}, readSlices(sv)...)
+				ss := readSlices(sv)
+				if ss == nil {
+					return syscall.EIO
+				}
+				ss = append([]*slice{{len: ChunkSize}}, ss...)
 				cs := buildSlice(ss)
 				tpos := coff
 				for _, s := range cs {
@@ -2099,20 +2146,20 @@ func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, 
 						indx := uint32(doff / ChunkSize)
 						dpos := uint32(doff % ChunkSize)
 						if dpos+s.Len > ChunkSize {
-							pipe.RPush(ctx, m.chunkKey(fout, indx), marshalSlice(dpos, s.Chunkid, s.Size, s.Off, ChunkSize-dpos))
-							if s.Chunkid > 0 {
-								pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Chunkid, s.Size), 1)
+							pipe.RPush(ctx, m.chunkKey(fout, indx), marshalSlice(dpos, s.Id, s.Size, s.Off, ChunkSize-dpos))
+							if s.Id > 0 {
+								pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
 							}
 
 							skip := ChunkSize - dpos
-							pipe.RPush(ctx, m.chunkKey(fout, indx+1), marshalSlice(0, s.Chunkid, s.Size, s.Off+skip, s.Len-skip))
-							if s.Chunkid > 0 {
-								pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Chunkid, s.Size), 1)
+							pipe.RPush(ctx, m.chunkKey(fout, indx+1), marshalSlice(0, s.Id, s.Size, s.Off+skip, s.Len-skip))
+							if s.Id > 0 {
+								pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
 							}
 						} else {
-							pipe.RPush(ctx, m.chunkKey(fout, indx), marshalSlice(dpos, s.Chunkid, s.Size, s.Off, s.Len))
-							if s.Chunkid > 0 {
-								pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Chunkid, s.Size), 1)
+							pipe.RPush(ctx, m.chunkKey(fout, indx), marshalSlice(dpos, s.Id, s.Size, s.Off, s.Len))
+							if s.Id > 0 {
+								pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), 1)
 							}
 						}
 					}
@@ -2206,10 +2253,10 @@ func (m *redisMeta) doCleanupSlices() {
 			if strings.HasPrefix(val, "-") { // < 0
 				ps := strings.Split(key, "_")
 				if len(ps) == 2 {
-					chunkid, _ := strconv.ParseUint(ps[0][1:], 10, 64)
+					id, _ := strconv.ParseUint(ps[0][1:], 10, 64)
 					size, _ := strconv.ParseUint(ps[1], 10, 32)
-					if chunkid > 0 && size > 0 {
-						m.deleteSlice(chunkid, uint32(size))
+					if id > 0 && size > 0 {
+						m.deleteSlice(id, uint32(size))
 					}
 				}
 			} else if val == "0" {
@@ -2238,7 +2285,7 @@ func (m *redisMeta) cleanupZeroRef(key string) {
 	}, m.sliceRefs())
 }
 
-func (m *redisMeta) cleanupLeakedChunks() {
+func (m *redisMeta) cleanupLeakedChunks(delete bool) {
 	var ctx = Background
 	prefix := len(m.prefix)
 	_ = m.scan(ctx, "c*", func(ckeys []string) error {
@@ -2264,10 +2311,12 @@ func (m *redisMeta) cleanupLeakedChunks() {
 				if rr.Val() == 0 {
 					key := ikeys[i]
 					logger.Infof("found leaked chunk %s", key)
-					ps := strings.Split(key, "_")
-					ino, _ := strconv.ParseInt(ps[0][prefix+1:], 10, 0)
-					indx, _ := strconv.Atoi(ps[1])
-					_ = m.deleteChunk(Ino(ino), uint32(indx))
+					if delete {
+						ps := strings.Split(key, "_")
+						ino, _ := strconv.ParseInt(ps[0][prefix+1:], 10, 0)
+						indx, _ := strconv.Atoi(ps[1])
+						_ = m.deleteChunk(Ino(ino), uint32(indx))
+					}
 				}
 			}
 		}
@@ -2275,7 +2324,7 @@ func (m *redisMeta) cleanupLeakedChunks() {
 	})
 }
 
-func (m *redisMeta) cleanupOldSliceRefs() {
+func (m *redisMeta) cleanupOldSliceRefs(delete bool) {
 	var ctx = Background
 	_ = m.scan(ctx, "k*", func(ckeys []string) error {
 		values, err := m.rdb.MGet(ctx, ckeys...).Result()
@@ -2298,7 +2347,9 @@ func (m *redisMeta) cleanupOldSliceRefs() {
 				logger.Infof("move refs %d for slice %s", vv, ckeys[i])
 			}
 		}
-		m.rdb.Del(ctx, todel...)
+		if delete && len(todel) > 0 {
+			m.rdb.Del(ctx, todel...)
+		}
 		return nil
 	})
 }
@@ -2310,43 +2361,37 @@ func (m *redisMeta) toDelete(inode Ino, length uint64) string {
 func (m *redisMeta) deleteChunk(inode Ino, indx uint32) error {
 	var ctx = Background
 	key := m.chunkKey(inode, indx)
-	for {
-		var slices []*slice
-		var rs []*redis.IntCmd
-		err := m.txn(ctx, func(tx *redis.Tx) error {
-			vals, err := tx.LRange(ctx, key, 0, 100).Result()
-			if err == redis.Nil {
-				return nil
-			}
-			slices = nil
-			rs = nil
-			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				for _, v := range vals {
-					pipe.LPop(ctx, key)
-					rb := utils.ReadBuffer([]byte(v))
-					_ = rb.Get32() // pos
-					chunkid := rb.Get64()
-					if chunkid == 0 {
-						continue
-					}
-					size := rb.Get32()
-					slices = append(slices, &slice{chunkid: chunkid, size: size})
-					rs = append(rs, pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(chunkid, size), -1))
+	var todel []*slice
+	var rs []*redis.IntCmd
+	err := m.txn(ctx, func(tx *redis.Tx) error {
+		todel = todel[:0]
+		rs = rs[:0]
+		vals, err := tx.LRange(ctx, key, 0, 1000000).Result()
+		if err == redis.Nil {
+			return nil
+		}
+		slices := readSlices(vals)
+		if slices == nil {
+			logger.Errorf("Corrupt value for inode %d chunk index %d, use `gc` to clean up leaked slices", inode, indx)
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Del(ctx, key)
+			for _, s := range slices {
+				if s.id > 0 {
+					todel = append(todel, s)
+					rs = append(rs, pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.id, s.size), -1))
 				}
-				return nil
-			})
-			return err
-		}, key)
-		if err != nil {
-			return fmt.Errorf("delete slice from chunk %s fail: %s, retry later", key, err)
-		}
-		for i, s := range slices {
-			if rs[i].Val() < 0 {
-				m.deleteSlice(s.chunkid, s.size)
 			}
-		}
-		if len(slices) < 100 {
-			break
+			return nil
+		})
+		return err
+	}, key)
+	if err != nil {
+		return fmt.Errorf("delete slice from chunk %s fail: %s, retry later", key, err)
+	}
+	for i, s := range todel {
+		if rs[i].Val() < 0 {
+			m.deleteSlice(s.id, s.size)
 		}
 	}
 	return nil
@@ -2392,8 +2437,9 @@ func (m *redisMeta) doDeleteFileData_(inode Ino, length uint64, tracking string)
 	_ = m.rdb.ZRem(ctx, m.delfiles(), tracking)
 }
 
-func (r *redisMeta) doCleanupDelayedSlices(edge int64, limit int) (int, error) {
+func (r *redisMeta) doCleanupDelayedSlices(edge int64) (int, error) {
 	ctx := Background
+	start := time.Now()
 	stop := fmt.Errorf("reach limit")
 	var count int
 	var ss []Slice
@@ -2414,13 +2460,13 @@ func (r *redisMeta) doCleanupDelayedSlices(edge int64, limit int) (int, error) {
 			}
 
 			if err := r.txn(ctx, func(tx *redis.Tx) error {
+				ss, rs = ss[:0], rs[:0]
 				val, e := tx.HGet(ctx, r.delSlices(), key).Result()
 				if e == redis.Nil {
 					return nil
 				} else if e != nil {
 					return e
 				}
-				ss, rs = ss[:0], rs[:0]
 				buf := []byte(val)
 				r.decodeDelayedSlices(buf, &ss)
 				if len(ss) == 0 {
@@ -2428,7 +2474,7 @@ func (r *redisMeta) doCleanupDelayedSlices(edge int64, limit int) (int, error) {
 				}
 				_, e = tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 					for _, s := range ss {
-						rs = append(rs, pipe.HIncrBy(ctx, r.sliceRefs(), r.sliceKey(s.Chunkid, s.Size), -1))
+						rs = append(rs, pipe.HIncrBy(ctx, r.sliceRefs(), r.sliceKey(s.Id, s.Size), -1))
 					}
 					pipe.HDel(ctx, r.delSlices(), key)
 					return nil
@@ -2440,13 +2486,13 @@ func (r *redisMeta) doCleanupDelayedSlices(edge int64, limit int) (int, error) {
 			}
 			for i, s := range ss {
 				if rs[i].Err() == nil && rs[i].Val() < 0 {
-					r.deleteSlice(s.Chunkid, s.Size)
+					r.deleteSlice(s.Id, s.Size)
 					count++
 				}
 			}
-			if count >= limit {
-				return stop
-			}
+		}
+		if time.Since(start) > 50*time.Minute {
+			return stop
 		}
 		return nil
 	})
@@ -2481,20 +2527,24 @@ func (m *redisMeta) compactChunk(inode Ino, indx uint32, force bool) {
 	}
 
 	ss := readSlices(vals)
+	if ss == nil {
+		logger.Errorf("Corrupt value for inode %d chunk indx %d", inode, indx)
+		return
+	}
 	skipped := skipSome(ss)
 	ss = ss[skipped:]
-	pos, size, chunks := compactChunk(ss)
+	pos, size, slices := compactChunk(ss)
 	if len(ss) < 2 || size == 0 {
 		return
 	}
 
-	var chunkid uint64
-	st := m.NewChunk(ctx, &chunkid)
+	var id uint64
+	st := m.NewSlice(ctx, &id)
 	if st != 0 {
 		return
 	}
 	logger.Debugf("compact %d:%d: skipped %d slices (%d bytes) %d slices (%d bytes)", inode, indx, skipped, pos, len(ss), size)
-	err = m.newMsg(CompactChunk, chunks, chunkid)
+	err = m.newMsg(CompactChunk, slices, id)
 	if err != nil {
 		if !strings.Contains(err.Error(), "not exist") && !strings.Contains(err.Error(), "not found") {
 			logger.Warnf("compact %d %d with %d slices: %s", inode, indx, len(ss), err)
@@ -2506,8 +2556,8 @@ func (m *redisMeta) compactChunk(inode Ino, indx uint32, force bool) {
 	trash := m.toTrash(0)
 	if trash {
 		for _, s := range ss {
-			if s.chunkid > 0 {
-				buf = append(buf, m.encodeDelayedSlice(s.chunkid, s.size)...)
+			if s.id > 0 {
+				buf = append(buf, m.encodeDelayedSlice(s.id, s.size)...)
 			}
 		}
 	} else {
@@ -2530,19 +2580,19 @@ func (m *redisMeta) compactChunk(inode Ino, indx uint32, force bool) {
 
 		_, err = tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.LTrim(ctx, key, int64(len(vals)), -1)
-			pipe.LPush(ctx, key, marshalSlice(pos, chunkid, size, 0, size))
+			pipe.LPush(ctx, key, marshalSlice(pos, id, size, 0, size))
 			for i := skipped; i > 0; i-- {
 				pipe.LPush(ctx, key, vals[i-1])
 			}
-			pipe.HSet(ctx, m.sliceRefs(), m.sliceKey(chunkid, size), "0") // create the key to tracking it
+			pipe.HSet(ctx, m.sliceRefs(), m.sliceKey(id, size), "0") // create the key to tracking it
 			if trash {
 				if len(buf) > 0 {
-					pipe.HSet(ctx, m.delSlices(), fmt.Sprintf("%d_%d", chunkid, time.Now().Unix()), buf)
+					pipe.HSet(ctx, m.delSlices(), fmt.Sprintf("%d_%d", id, time.Now().Unix()), buf)
 				}
 			} else {
 				for i, s := range ss {
-					if s.chunkid > 0 {
-						rs[i] = pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.chunkid, s.size), -1)
+					if s.id > 0 {
+						rs[i] = pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.id, s.size), -1)
 					}
 				}
 			}
@@ -2552,7 +2602,7 @@ func (m *redisMeta) compactChunk(inode Ino, indx uint32, force bool) {
 	}, key))
 	// there could be false-negative that the compaction is successful, double-check
 	if errno != 0 && errno != syscall.EINVAL {
-		if e := m.rdb.HGet(ctx, m.sliceRefs(), m.sliceKey(chunkid, size)).Err(); e == redis.Nil {
+		if e := m.rdb.HGet(ctx, m.sliceRefs(), m.sliceKey(id, size)).Err(); e == redis.Nil {
 			errno = syscall.EINVAL // failed
 		} else if e == nil {
 			errno = 0 // successful
@@ -2560,16 +2610,16 @@ func (m *redisMeta) compactChunk(inode Ino, indx uint32, force bool) {
 	}
 
 	if errno == syscall.EINVAL {
-		m.rdb.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(chunkid, size), -1)
-		logger.Infof("compaction for %d:%d is wasted, delete slice %d (%d bytes)", inode, indx, chunkid, size)
-		m.deleteSlice(chunkid, size)
+		m.rdb.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(id, size), -1)
+		logger.Infof("compaction for %d:%d is wasted, delete slice %d (%d bytes)", inode, indx, id, size)
+		m.deleteSlice(id, size)
 	} else if errno == 0 {
 		m.of.InvalidateChunk(inode, indx)
-		m.cleanupZeroRef(m.sliceKey(chunkid, size))
+		m.cleanupZeroRef(m.sliceKey(id, size))
 		if !trash {
 			for i, s := range ss {
-				if s.chunkid > 0 && rs[i].Err() == nil && rs[i].Val() < 0 {
-					m.deleteSlice(s.chunkid, s.size)
+				if s.id > 0 && rs[i].Err() == nil && rs[i].Val() < 0 {
+					m.deleteSlice(s.id, s.size)
 				}
 			}
 		}
@@ -2588,17 +2638,16 @@ func (m *redisMeta) compactChunk(inode Ino, indx uint32, force bool) {
 	}
 }
 
-func (m *redisMeta) CompactAll(ctx Context, bar *utils.Bar) syscall.Errno {
+func (m *redisMeta) scanAllChunks(ctx Context, ch chan<- cchunk, bar *utils.Bar) error {
 	p := m.rdb.Pipeline()
-	return errno(m.scan(ctx, "c*_*", func(keys []string) error {
-		bar.IncrTotal(int64(len(keys)))
+	return m.scan(ctx, "c*_*", func(keys []string) error {
 		for _, key := range keys {
 			_ = p.LLen(ctx, key)
 		}
 		cmds, err := p.Exec(ctx)
 		if err != nil {
 			logger.Warnf("list slices: %s", err)
-			return errno(err)
+			return err
 		}
 		for i, cmd := range cmds {
 			cnt := cmd.(*redis.IntCmd).Val()
@@ -2607,14 +2656,13 @@ func (m *redisMeta) CompactAll(ctx Context, bar *utils.Bar) syscall.Errno {
 				var indx uint32
 				n, err := fmt.Sscanf(keys[i], m.prefix+"c%d_%d", &inode, &indx)
 				if err == nil && n == 2 {
-					logger.Debugf("compact chunk %d:%d (%d slices)", inode, indx, cnt)
-					m.compactChunk(Ino(inode), indx, true)
+					bar.IncrTotal(1)
+					ch <- cchunk{Ino(inode), indx, int(cnt)}
 				}
 			}
-			bar.Increment()
 		}
 		return nil
-	}))
+	})
 }
 
 func (m *redisMeta) cleanupLeakedInodes(delete bool) {
@@ -2722,8 +2770,8 @@ func (m *redisMeta) hscan(ctx context.Context, key string, f func([]string) erro
 
 func (m *redisMeta) ListSlices(ctx Context, slices map[Ino][]Slice, delete bool, showProgress func()) syscall.Errno {
 	m.cleanupLeakedInodes(delete)
-	m.cleanupLeakedChunks()
-	m.cleanupOldSliceRefs()
+	m.cleanupLeakedChunks(delete)
+	m.cleanupOldSliceRefs(delete)
 	if delete {
 		m.doCleanupSlices()
 	}
@@ -2743,9 +2791,13 @@ func (m *redisMeta) ListSlices(ctx Context, slices map[Ino][]Slice, delete bool,
 			inode, _ := strconv.Atoi(strings.Split(key[len(m.prefix)+1:], "_")[0])
 			vals := cmd.(*redis.StringSliceCmd).Val()
 			ss := readSlices(vals)
+			if ss == nil {
+				logger.Errorf("Corrupt value for inode %d chunk key %s", inode, key)
+				continue
+			}
 			for _, s := range ss {
-				if s.chunkid > 0 {
-					slices[Ino(inode)] = append(slices[Ino(inode)], Slice{Chunkid: s.chunkid, Size: s.size})
+				if s.id > 0 {
+					slices[Ino(inode)] = append(slices[Ino(inode)], Slice{Id: s.id, Size: s.size})
 					if showProgress != nil {
 						showProgress()
 					}
@@ -2758,25 +2810,198 @@ func (m *redisMeta) ListSlices(ctx Context, slices map[Ino][]Slice, delete bool,
 		return errno(err)
 	}
 
-	var ss []Slice
-	err = m.hscan(ctx, m.delSlices(), func(keys []string) error {
-		for i := 0; i < len(keys); i += 2 {
-			ss = ss[:0]
-			m.decodeDelayedSlices([]byte(keys[i+1]), &ss)
-			if showProgress != nil {
-				for range ss {
-					showProgress()
-				}
+	return errno(m.scanTrashSlices(ctx, func(ss []Slice, _ int64) (bool, error) {
+		slices[1] = append(slices[1], ss...)
+		if showProgress != nil {
+			for range ss {
+				showProgress()
 			}
-			for _, s := range ss {
-				if s.Chunkid > 0 {
-					slices[1] = append(slices[1], s)
+		}
+		return false, nil
+	}))
+}
+
+func (m *redisMeta) scanTrashSlices(ctx Context, scan trashSliceScan) error {
+	if scan == nil {
+		return nil
+	}
+
+	delKeys := make(chan string, 1000)
+	c, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		_ = m.hscan(c, m.delSlices(), func(keys []string) error {
+			for i := 0; i < len(keys); i += 2 {
+				delKeys <- keys[i]
+			}
+			return nil
+		})
+		close(delKeys)
+	}()
+
+	var ss []Slice
+	var rs []*redis.IntCmd
+	for key := range delKeys {
+		var clean bool
+		task := func(tx *redis.Tx) error {
+			ss = ss[:0]
+			rs = rs[:0]
+			val, err := tx.HGet(ctx, m.delSlices(), key).Result()
+			if err == redis.Nil {
+				return nil
+			} else if err != nil {
+				return err
+			}
+			ps := strings.Split(key, "_")
+			if len(ps) != 2 {
+				return fmt.Errorf("invalid key %s", key)
+			}
+			ts, err := strconv.ParseInt(ps[1], 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid key %s, fail to parse timestamp", key)
+			}
+
+			m.decodeDelayedSlices([]byte(val), &ss)
+			clean, err = scan(ss, ts)
+			if err != nil {
+				return err
+			}
+			if clean {
+				_, err = tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+					for _, s := range ss {
+						rs = append(rs, pipe.HIncrBy(ctx, m.sliceRefs(), m.sliceKey(s.Id, s.Size), -1))
+					}
+					pipe.HDel(ctx, m.delSlices(), key)
+					return nil
+				})
+			}
+			return err
+		}
+		err := m.txn(ctx, task, m.delSlices())
+		if err != nil {
+			return err
+		}
+		if clean && len(rs) == len(ss) {
+			for i, s := range ss {
+				if rs[i].Err() == nil && rs[i].Val() < 0 {
+					m.deleteSlice(s.Id, s.Size)
 				}
 			}
 		}
+	}
+
+	return nil
+}
+
+func (m *redisMeta) scanPendingSlices(ctx Context, scan pendingSliceScan) error {
+	if scan == nil {
 		return nil
-	})
-	return errno(err)
+	}
+
+	pendingKeys := make(chan string, 1000)
+	c, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		_ = m.hscan(c, m.sliceRefs(), func(keys []string) error {
+			for i := 0; i < len(keys); i += 2 {
+				val := keys[i+1]
+				refs, err := strconv.ParseInt(val, 10, 64)
+				if err != nil {
+					// ignored
+					logger.Warn(errors.Wrapf(err, "parse slice ref: %s", val))
+					return nil
+				}
+				if refs < 0 {
+					pendingKeys <- keys[i]
+				}
+			}
+			return nil
+		})
+		close(pendingKeys)
+	}()
+
+	for key := range pendingKeys {
+		ps := strings.Split(key[1:], "_")
+		if len(ps) != 2 {
+			return fmt.Errorf("invalid key %s", key)
+		}
+		id, err := strconv.ParseUint(ps[0], 10, 64)
+		if err != nil {
+			return errors.Wrapf(err, "invalid key %s, fail to parse id", key)
+		}
+		size, err := strconv.ParseUint(ps[1], 10, 64)
+		if err != nil {
+			return errors.Wrapf(err, "invalid key %s, fail to parse size", key)
+		}
+		clean, err := scan(id, uint32(size))
+		if err != nil {
+			return errors.Wrap(err, "scan pending slices")
+		}
+		if clean {
+			// TODO: m.deleteSlice(id, uint32(size))
+			// avoid lint warning
+			_ = clean
+		}
+	}
+	return nil
+}
+
+func (m *redisMeta) scanPendingFiles(ctx Context, scan pendingFileScan) error {
+	if scan == nil {
+		return nil
+	}
+
+	visited := make(map[Ino]bool)
+	start := int64(0)
+	const batchSize = 1000
+	for {
+		pairs, err := m.rdb.ZRangeWithScores(Background, m.delfiles(), start, start+batchSize).Result()
+		if err != nil {
+			return err
+		}
+		start += batchSize
+		for _, p := range pairs {
+			v := p.Member.(string)
+			ps := strings.Split(v, ":")
+			if len(ps) != 2 { // will be cleaned up as legacy
+				continue
+			}
+			inode, _ := strconv.ParseUint(ps[0], 10, 64)
+			if visited[Ino(inode)] {
+				continue
+			}
+			visited[Ino(inode)] = true
+			size, _ := strconv.ParseUint(ps[1], 10, 64)
+			clean, err := scan(Ino(inode), size, int64(p.Score))
+			if err != nil {
+				return err
+			}
+			if clean {
+				m.doDeleteFileData_(Ino(inode), size, v)
+			}
+		}
+		if len(pairs) < batchSize {
+			break
+		}
+	}
+	return nil
+}
+
+func (m *redisMeta) doRepair(ctx Context, inode Ino, attr *Attr) syscall.Errno {
+	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+		attr.Nlink = 2
+		vals, err := tx.HGetAll(ctx, m.entryKey(inode)).Result()
+		if err != nil {
+			return err
+		}
+		for _, v := range vals {
+			typ, _ := m.parseEntry([]byte(v))
+			if typ == TypeDirectory {
+				attr.Nlink++
+			}
+		}
+		return tx.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0).Err()
+	}, m.entryKey(inode), m.inodeKey(inode)))
 }
 
 func (m *redisMeta) GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) syscall.Errno {
@@ -2806,12 +3031,11 @@ func (m *redisMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Err
 }
 
 func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
-	c := Background
 	key := m.xattrKey(inode)
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		switch flags {
 		case XattrCreate:
-			ok, err := tx.HSetNX(c, key, name, value).Result()
+			ok, err := tx.HSetNX(ctx, key, name, value).Result()
 			if err != nil {
 				return err
 			}
@@ -2820,7 +3044,7 @@ func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte
 			}
 			return nil
 		case XattrReplace:
-			if ok, err := tx.HExists(c, key, name).Result(); err != nil {
+			if ok, err := tx.HExists(ctx, key, name).Result(); err != nil {
 				return err
 			} else if !ok {
 				return ENOATTR
@@ -2923,7 +3147,9 @@ func (m *redisMeta) dumpEntries(es ...*DumpedEntry) error {
 				if err != redis.Nil {
 					return err
 				}
-				logger.Warnf("The entry of the inode was not found. inode: %v", inode)
+				if inode != TrashInode {
+					logger.Warnf("The entry of the inode was not found. inode: %d", inode)
+				}
 			}
 
 			var attr Attr
@@ -2950,6 +3176,7 @@ func (m *redisMeta) dumpEntries(es ...*DumpedEntry) error {
 			}
 			switch typ {
 			case TypeFile:
+				e.Chunks = e.Chunks[:0]
 				if attr.Length > 0 {
 					vals, err := cr[i].Result()
 					if err != nil {
@@ -2957,9 +3184,12 @@ func (m *redisMeta) dumpEntries(es ...*DumpedEntry) error {
 					}
 					if len(vals) > 0 {
 						ss := readSlices(vals)
+						if ss == nil {
+							logger.Errorf("Corrupt value for inode %d chunk index %d", inode, 0)
+						}
 						slices := make([]*DumpedSlice, 0, len(ss))
 						for _, s := range ss {
-							slices = append(slices, &DumpedSlice{Chunkid: s.chunkid, Pos: s.pos, Size: s.size, Off: s.off, Len: s.len})
+							slices = append(slices, &DumpedSlice{Id: s.id, Pos: s.pos, Size: s.size, Off: s.off, Len: s.len})
 						}
 						e.Chunks = append(e.Chunks, &DumpedChunk{0, slices})
 					}
@@ -3010,12 +3240,15 @@ func (m *redisMeta) dumpEntries(es ...*DumpedEntry) error {
 					return err
 				}
 				if len(vals) > 0 {
+					e := es[lcs[i].i]
 					ss := readSlices(vals)
+					if ss == nil {
+						logger.Errorf("Corrupt value for inode %d chunk index %d", e.Attr.Inode, lcs[i].indx)
+					}
 					slices := make([]*DumpedSlice, 0, len(ss))
 					for _, s := range ss {
-						slices = append(slices, &DumpedSlice{Chunkid: s.chunkid, Pos: s.pos, Size: s.size, Off: s.off, Len: s.len})
+						slices = append(slices, &DumpedSlice{Id: s.id, Pos: s.pos, Size: s.size, Off: s.off, Len: s.len})
 					}
-					e := es[lcs[i].i]
 					e.Chunks = append(e.Chunks, &DumpedChunk{lcs[i].indx, slices})
 				}
 			}
@@ -3114,7 +3347,7 @@ func (m *redisMeta) dumpDir(inode Ino, tree *DumpedEntry, bw *bufio.Writer, dept
 	return nil
 }
 
-func (m *redisMeta) DumpMeta(w io.Writer, root Ino) (err error) {
+func (m *redisMeta) DumpMeta(w io.Writer, root Ino, keepSecret bool) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			if e, ok := p.(error); ok {
@@ -3177,7 +3410,7 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino) (err error) {
 	}
 
 	dm := &DumpedMeta{
-		Setting: m.fmt,
+		Setting: *m.fmt,
 		Counters: &DumpedCounters{
 			UsedSpace:   cs[0],
 			UsedInodes:  cs[1],
@@ -3189,11 +3422,11 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino) (err error) {
 		Sustained: sessions,
 		DelFiles:  dels,
 	}
-	if dm.Setting.SecretKey != "" {
+	if !keepSecret && dm.Setting.SecretKey != "" {
 		dm.Setting.SecretKey = "removed"
 		logger.Warnf("Secret key is removed for the sake of safety")
 	}
-	if dm.Setting.SessionToken != "" {
+	if !keepSecret && dm.Setting.SessionToken != "" {
 		dm.Setting.SessionToken = "removed"
 		logger.Warnf("Session token is removed for the sake of safety")
 	}
@@ -3259,7 +3492,7 @@ func (m *redisMeta) loadEntry(e *DumpedEntry, p redis.Pipeliner, tryExec func())
 			}
 			slices := make([]string, 0, len(c.Slices))
 			for _, s := range c.Slices {
-				slices = append(slices, string(marshalSlice(s.Pos, s.Chunkid, s.Size, s.Off, s.Len)))
+				slices = append(slices, string(marshalSlice(s.Pos, s.Id, s.Size, s.Off, s.Len)))
 				if len(slices) > batch {
 					p.RPush(ctx, m.chunkKey(inode, c.Index), slices)
 					tryExec()

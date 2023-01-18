@@ -3,63 +3,72 @@ name: verify
 on:
   push:
     branches:
-    - main
-    - 'release-**'
-    paths:
-    - '**.go'
+      - main
+      - 'release-**'
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '.github/**'
   pull_request:
     branches:
-    - 'main'
-    - 'release-**'
-    paths:
-    - '**.yml'
-    - '**.go'
-    - 'Makefile'
+      - 'main'
+      - 'release-**'
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '.github/**'
   workflow_dispatch:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     steps:
-      - uses: actions/setup-go@v2
+      - uses: actions/setup-go@v3
         with:
-          go-version: '1.17.x'
-      - uses: actions/checkout@v2
+          go-version: '1.18.x'
+      - uses: actions/checkout@v3
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v3
         with:
-          version: v1.29
+          version: v1.49.0
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     steps:
-    - name: Set up Go
-      uses: actions/setup-go@v2
-      with:
-        go-version: '1.17.x'
-      id: go
-
     - name: Check out code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
 
+    - name: Set up Go
+      uses: actions/setup-go@v3
+      with:
+        go-version: '1.18.x'
+        cache: true
+      id: go
+      
     - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install g++-multilib gcc-mingw-w64
 
     - name: Build linux target
-      run: GOPATH=$HOME/go make
+      run: make
 
     - name: build lite
-      run: GOPATH=$HOME/go make juicefs.lite
+      run: make juicefs.lite
 
     - name: build windows
-      run: GOPATH=$HOME/go make juicefs.exe
+      run: make juicefs.exe
 
     - name: build libjfs.dll
-      run: GOPATH=$HOME/go make -C sdk/java/libjfs libjfs.dll
+      run: make -C sdk/java/libjfs libjfs.dll
 
     - name: build ceph
       run: |
         sudo apt-get update
         sudo apt-get install librados-dev
-        GOPATH=$HOME/go make juicefs.ceph
+        make juicefs.ceph
+
+    - name: build fdb
+      run: |
+        wget https://github.com/apple/foundationdb/releases/download/6.3.23/foundationdb-clients_6.3.23-1_amd64.deb
+        sudo dpkg -i foundationdb-clients_6.3.23-1_amd64.deb
+        make juicefs.fdb

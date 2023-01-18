@@ -29,7 +29,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/huaweicloud/huaweicloud-sdk-go-obs/obs"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -39,9 +41,10 @@ import (
 const obsDefaultRegion = "cn-north-1"
 
 type obsClient struct {
-	bucket string
-	region string
-	c      *obs.ObsClient
+	bucket    string
+	region    string
+	checkEtag bool
+	c         *obs.ObsClient
 }
 
 func (s *obsClient) String() string {
@@ -133,7 +136,7 @@ func (s *obsClient) Put(key string, in io.Reader) error {
 	params.ContentMD5 = base64.StdEncoding.EncodeToString(sum[:])
 	params.ContentType = mimeType
 	resp, err := s.c.PutObject(params)
-	if err == nil && strings.Trim(resp.ETag, "\"") != obs.Hex(sum) {
+	if err == nil && s.checkEtag && strings.Trim(resp.ETag, "\"") != obs.Hex(sum) {
 		err = fmt.Errorf("unexpected ETag: %s != %s", strings.Trim(resp.ETag, "\""), obs.Hex(sum))
 	}
 	return err
@@ -157,13 +160,14 @@ func (s *obsClient) Delete(key string) error {
 	return err
 }
 
-func (s *obsClient) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *obsClient) List(prefix, marker, delimiter string, limit int64) ([]Object, error) {
 	input := &obs.ListObjectsInput{
 		Bucket: s.bucket,
 		Marker: marker,
 	}
 	input.Prefix = prefix
 	input.MaxKeys = int(limit)
+	input.Delimiter = delimiter
 	resp, err := s.c.ListObjects(input)
 	if err != nil {
 		return nil, err
@@ -173,6 +177,12 @@ func (s *obsClient) List(prefix, marker string, limit int64) ([]Object, error) {
 	for i := 0; i < n; i++ {
 		o := resp.Contents[i]
 		objs[i] = &obj{o.Key, o.Size, o.LastModified, strings.HasSuffix(o.Key, "/")}
+	}
+	if delimiter != "" {
+		for _, p := range resp.CommonPrefixes {
+			objs = append(objs, &obj{p, 0, time.Unix(0, 0), true})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
 	}
 	return objs, nil
 }
@@ -203,7 +213,7 @@ func (s *obsClient) UploadPart(key string, uploadID string, num int, body []byte
 	sum := md5.Sum(body)
 	params.ContentMD5 = base64.StdEncoding.EncodeToString(sum[:])
 	resp, err := s.c.UploadPart(params)
-	if err == nil && strings.Trim(resp.ETag, "\"") != obs.Hex(sum[:]) {
+	if err == nil && s.checkEtag && strings.Trim(resp.ETag, "\"") != obs.Hex(sum[:]) {
 		err = fmt.Errorf("unexpected ETag: %s != %s", strings.Trim(resp.ETag, "\""), obs.Hex(sum[:]))
 	}
 	if err != nil {
@@ -326,11 +336,19 @@ func newOBS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 	// Empty proxy url string has no effect
 	// there is a bug in the retry of PUT (did not call Seek(0,0) before retry), so disable the retry here
 	c, err := obs.New(accessKey, secretKey, endpoint, obs.WithSecurityToken(token),
-		obs.WithProxyUrl(urlString), obs.WithMaxRetryCount(0))
+		obs.WithProxyUrl(urlString), obs.WithMaxRetryCount(0), obs.WithHttpTransport(httpClient.Transport.(*http.Transport)))
 	if err != nil {
 		return nil, fmt.Errorf("fail to initialize OBS: %q", err)
 	}
-	return &obsClient{bucketName, region, c}, nil
+	var checkEtag bool
+	if _, err = c.GetBucketEncryption(bucketName); err != nil {
+		if obsError, ok := err.(*obs.ObsError); ok && obsError.Code == "NoSuchEncryptionConfiguration" {
+			checkEtag = true
+		} else if !ok || obsError.Code != "NoSuchBucket" {
+			logger.Warnf("get bucket encryption: %q", err)
+		}
+	}
+	return &obsClient{bucket: bucketName, region: region, checkEtag: checkEtag, c: c}, nil
 }
 
 func init() {

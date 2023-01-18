@@ -3,15 +3,18 @@ sidebar_label: Redis
 sidebar_position: 1
 slug: /redis_best_practices
 ---
+
+import Badge from '@site/src/components/Badge';
+
 # Redis 最佳实践
 
 当采用 Redis 作为 JuiceFS 元数据存储引擎时，即由 Redis 负责存储所有元数据并响应客户端对元数据的操作。若 Redis 出现连接不稳定、服务不可用或元数据丢失等问题，可能会导致读写速度慢或数据损坏等情况。
 
 :::tip 建议
-强烈建议使用云平台提供的 Redis 托管服务，详情查看「[推荐的 Redis 托管服务](#推荐的-redis-托管服务)」。
+如果条件允许，强烈建议使用云平台提供的 Redis 托管服务，详情查看[「推荐的 Redis 托管服务」](#推荐的-redis-托管服务)。
 :::
 
-对于自主维护的 Redis 数据库，JuiceFS 要求其版本至少为 4.0+，并推荐使用较新的「[官方稳定版本](https://redis.io/download)」。另外，在部署 Redis 前还建议您提前了解以下几个方面。
+对于自主维护的 Redis 数据库，JuiceFS 要求其版本为 4.0 及以上版本，并推荐使用较新的[官方稳定版本](https://redis.io/download)。另外，在部署 Redis 前还建议您提前了解以下几个方面。
 
 :::note 注意
 本文部分内容来自 Redis 官网，若有不一致的表述，请以 Redis 官方文档为准。
@@ -36,13 +39,11 @@ used_memory_dataset: 13439673592
 used_memory_dataset_perc: 70.12%
 ```
 
-其中 `used_memory_rss` 是 Redis 实际使用的总内存大小，这里既包含了存储在 Redis 中的数据大小（也就是上面的 `used_memory_dataset`），也包含了一些 Redis 的[系统开销](https://redis.io/commands/memory-stats)（也就是上面的 `used_memory_overhead`）。前面提到每个文件的元数据大约占用 300 字节是通过 `used_memory_dataset` 来计算的，如果你发现你的 JuiceFS 文件系统中单个文件元数据占用空间远大于 300 字节，可以尝试运行 [`juicefs gc`](../../reference/command_reference.md#juicefs-gc) 命令来清理可能存在的冗余数据。
+其中 `used_memory_rss` 是 Redis 实际使用的总内存大小，这里既包含了存储在 Redis 中的数据大小（也就是上面的 `used_memory_dataset`），也包含了一些 Redis 的[系统开销](https://redis.io/commands/memory-stats)（也就是上面的 `used_memory_overhead`）。前面提到每个文件的元数据大约占用 300 字节是通过 `used_memory_dataset` 来计算的，如果你发现你的 JuiceFS 文件系统中单个文件元数据占用空间远大于 300 字节，可以尝试运行 [`juicefs gc`](../../reference/command_reference.md#gc) 命令来清理可能存在的冗余数据。
 
 ## 数据可用性
 
-:::caution 注意
-JuiceFS 使用 「[Redis 事务](https://redis.io/docs/manual/transactions)」保证元数据操作的原子性。但由于 Redis Cluster 集群模式不支持事务（Transactions），因此 Redis 集群不可用作 JuiceFS 元数据存储。如有 Redis 高可用需求，请使用 Sentinel 哨兵模式。
-:::
+### 哨兵模式 {#sentinel-mode}
 
 [Redis 哨兵](https://redis.io/docs/manual/sentinel) 是 Redis 官方的高可用解决方案，它提供以下功能：
 
@@ -79,18 +80,34 @@ juicefs mount redis://:password@masterName,1.2.3.4,1.2.5.6:26379/2 ~/jfs
 需要注意由于 Redis 主节点的数据是异步复制到副本节点，因此有可能读到的元数据不是最新的。
 :::
 
+### 集群模式 {#cluster-mode}
+
+:::note 注意
+此特性需要使用 1.0.0 及以上版本的 JuiceFS
+:::
+
+JuiceFS 同样支持集群模式的 Redis 作为元数据引擎，Redis 集群模式的 `META-URL` 为 `redis[s]://[[USER]:PASSWORD@]ADDR:PORT,[ADDR:PORT],[ADDR:PORT][/DB]`，例如：
+
+```shell
+juicefs format redis://127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002/1 myjfs
+```
+
+:::tip 提示
+Redis 集群不再支持多数据库，而是将所有 keys 分散到 16384 个 hash slots 中，再将这些 hash slots 打散到多个 Redis master 节点来存储。JuiceFS 利用了 Redis 集群的 [Hash Tag](https://redis.io/docs/reference/cluster-spec/#hash-tags) 特性，通过将 `{DB}` 作为 key 的前缀来将一个文件系统中的所有 keys 都存放在同一个 hash slot，以保证集群模式下操作的事务性。另外，通过设置不同的 `DB` 可以让一个 Redis 集群同时作为多个 JuiceFS 的元数据库。
+:::
+
 ## 数据持久性
 
 Redis 提供了不同范围的[持久性](https://redis.io/docs/manual/persistence)选项：
 
 - **RDB**：以指定的时间间隔生成当前数据集的快照。
 - **AOF**：记录服务器收到的每一个写操作，在服务器启动时重建原始数据集。命令使用与 Redis 协议本身相同的格式以追加写（append-only）的方式记录。当日志变得太大时，Redis 能够在后台重写日志。
-- **RDB+AOF** <span className="badge badge--success">建议</span>：组合使用 AOF 和 RDB。在这种情况下，当 Redis 重新启动时，AOF 文件将用于重建原始数据集，因为它保证是最完整的。
+- **RDB+AOF** <Badge type="success">建议</Badge>：组合使用 AOF 和 RDB。在这种情况下，当 Redis 重新启动时，AOF 文件将用于重建原始数据集，因为它保证是最完整的。
 
 当使用 AOF 时，您可以有不同的 fsync 策略：
 
 1. 没有 fsync；
-2. 每秒 fsync <span className="badge badge--primary">默认</span>；
+2. 每秒 fsync <Badge type="primary">默认</Badge>；
 3. 每次查询 fsync。
 
 默认策略「每秒 fsync」是不错的选择（fsync 是使用后台线程执行的，当没有 fsync 正在进行时，主线程会努力执行写入），**但你可能丢失最近一秒钟的写入**。
@@ -113,7 +130,7 @@ Redis 对数据备份非常友好，因为您可以在数据库运行时复制 R
 
 - 在您的服务器中创建一个 cron 任务，在一个目录中创建 RDB 文件的每小时快照，并在另一个目录中创建每日快照。
 - 每次 cron 脚本运行时，请务必调用 `find` 命令以确保删除太旧的快照：例如，您可以保留最近 48 小时的每小时快照，以及一至两个月的每日快照。要确保使用数据和时间信息来命名快照。
-- 确保每天至少一次将 RDB 快照从运行 Redis 的实例传输至 _数据中心以外_ 或至少传输至 _物理机以外_ 。
+- 确保每天至少一次将 RDB 快照从运行 Redis 的实例传输至 _数据中心以外_ 或至少传输至 _物理机以外_。
 
 更多信息请阅读[官方文档](https://redis.io/docs/manual/persistence)。
 
@@ -125,17 +142,15 @@ Redis 对数据备份非常友好，因为您可以在数据库运行时复制 R
 
 在恢复完 Redis 数据以后，可以继续通过新的 Redis 地址使用 JuiceFS 文件系统。建议运行 [`juicefs fsck`](../../reference/command_reference.md#juicefs-fsck) 命令检查文件系统数据的完整性。
 
----
-
 ## 推荐的 Redis 托管服务
+
+### Amazon MemoryDB for Redis
+
+[Amazon MemoryDB for Redis](https://aws.amazon.com/memorydb) 是一种持久的内存数据库服务，可提供超快的性能。MemoryDB 与 Redis 兼容，使用 MemoryDB，你的所有数据都存储在内存中，这使你能够实现微秒级读取和数毫秒的写入延迟和高吞吐。MemoryDB 还使用多可用区事务日志跨多个可用区持久存储数据，以实现快速故障切换、数据库恢复和节点重启。
 
 ### Amazon ElastiCache for Redis
 
 [Amazon ElastiCache for Redis](https://aws.amazon.com/elasticache/redis) 是为云构建的完全托管的、与 Redis 兼容的内存数据存储。它提供[自动故障切换](https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/AutoFailover.html)、[自动备份](https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/backups-automatic.html)等功能以确保可用性和持久性。
-
-:::info 说明
-Amazon ElastiCache for Redis 有两种类型：禁用集群模式和启用集群模式。因为 JuiceFS 使用[事务](https://redis.io/docs/manual/transactions)来保证元数据操作的原子性，所以不能使用「启用集群模式」类型。
-:::
 
 ### Google Cloud Memorystore for Redis
 
@@ -145,18 +160,105 @@ Amazon ElastiCache for Redis 有两种类型：禁用集群模式和启用集群
 
 [Azure Cache for Redis](https://azure.microsoft.com/en-us/services/cache) 是一个完全托管的内存缓存，支持高性能和可扩展的架构。使用它来创建云或混合部署，以亚毫秒级延迟处理每秒数百万个请求——所有这些都具有托管服务的配置、安全性和可用性优势。
 
-### 阿里云 ApsaraDB for Redis
+### 阿里云云数据库 Redis 版
 
-[阿里云 ApsaraDB for Redis](https://www.alibabacloud.com/product/apsaradb-for-redis) 是一种兼容原生 Redis 协议的数据库服务。它支持混合内存和硬盘以实现数据持久性。云数据库 Redis 版提供高可用的热备架构，可扩展以满足高性能、低延迟的读写操作需求。
+[阿里云云数据库 Redis 版](https://www.aliyun.com/product/kvstore)是一种兼容原生 Redis 协议的数据库服务。它支持混合内存和硬盘以实现数据持久性。云数据库 Redis 版提供高可用的热备架构，可扩展以满足高性能、低延迟的读写操作需求。
 
-:::info 说明
-ApsaraDB for Redis 支持 3 种类型的[架构](https://www.alibabacloud.com/help/doc-detail/86132.htm)：标准、集群和读写分离。因为 JuiceFS 使用[事务](https://redis.io/docs/manual/transactions)来保证元数据操作的原子性，所以不能使用集群类型架构。
-:::
+### 腾讯云云数据库 Redis
 
-### 腾讯云 TencentDB for Redis
+[腾讯云云数据库 Redis](https://cloud.tencent.com/product/crs) 是一种兼容 Redis 协议的缓存和存储服务。丰富多样的数据结构选项，帮助您开发不同类型的业务场景，提供主从热备份、容灾自动切换、数据备份、故障转移、实例监控、在线等一整套数据库服务缩放和数据回滚。
 
-[腾讯云 TencentDB for Redis](https://intl.cloud.tencent.com/product/crs) 是一种兼容 Redis 协议的缓存和存储服务。丰富多样的数据结构选项，帮助您开发不同类型的业务场景，提供主从热备份、容灾自动切换、数据备份、故障转移、实例监控、在线等一整套数据库服务缩放和数据回滚。
+## 使用 Redis 兼容的产品
 
-:::info 说明
-TencentDB for Redis 支持两种类型的[架构](https://intl.cloud.tencent.com/document/product/239/3205)：标准和集群。因为 JuiceFS 使用[事务](https://redis.io/docs/manual/transactions)来保证元数据操作的原子性，所以不能使用集群类型架构。
-:::
+如果想要使用 Redis 兼容产品作为元数据引擎，需要确认是否完整支持 JuiceFS 所需的以下 Redis 数据类型和命令。
+
+### JuiceFS 使用到的 Redis 数据类型
+
++ [String](https://redis.io/docs/data-types/strings)
++ [Set](https://redis.io/docs/data-types/sets)
++ [Sorted Set](https://redis.io/docs/data-types/sorted-sets)
++ [Hash](https://redis.io/docs/data-types/hashes)
++ [List](https://redis.io/docs/data-types/lists)
+
+### JuiceFS 使用到的 Redis 特性
+
++ [管道](https://redis.io/docs/manual/pipelining)
+
+### JuiceFS 使用到的 Redis 命令
+
+#### String
+
++ [DECRBY](https://redis.io/commands/decrby)
++ [DEL](https://redis.io/commands/del)
++ [GET](https://redis.io/commands/get)
++ [INCR](https://redis.io/commands/incr)
++ [INCRBY](https://redis.io/commands/incrby)
++ [DECR](https://redis.io/commands/decr)
++ [MGET](https://redis.io/commands/mget)
++ [MSET](https://redis.io/commands/mset)
++ [SETNX](https://redis.io/commands/setnx)
++ [SET](https://redis.io/commands/set)
+
+#### Set
+
++ [SADD](https://redis.io/commands/sadd)
++ [SMEMBERS](https://redis.io/commands/smembers)
++ [SREM](https://redis.io/commands/srem)
+
+#### Sorted Set
+
++ [ZADD](https://redis.io/commands/zadd)
++ [ZRANGEBYSCORE](https://redis.io/commands/zrangebyscore)
++ [ZRANGE](https://redis.io/commands/zrange)
++ [ZREM](https://redis.io/commands/zrem)
++ [ZSCORE](https://redis.io/commands/zscore)
+
+#### Hash
+
++ [HDEL](https://redis.io/commands/hdel)
++ [HEXISTS](https://redis.io/commands/hexists)
++ [HGETALL](https://redis.io/commands/hgetall)
++ [HGET](https://redis.io/commands/hget)
++ [HINCRBY](https://redis.io/commands/hincrby)
++ [HKEYS](https://redis.io/commands/hkeys)
++ [HSCAN](https://redis.io/commands/hscan)
++ [HSETNX](https://redis.io/commands/hsetnx)
++ [HSET](https://redis.io/commands/hset)（需要支持设置多个 field 和 value）
+
+#### List
+
++ [LLEN](https://redis.io/commands/llen)
++ [LPUSH](https://redis.io/commands/lpush)
++ [LRANGE](https://redis.io/commands/lrange)
++ [LTRIM](https://redis.io/commands/ltrim)
++ [RPUSHX](https://redis.io/commands/rpushx)
++ [RPUSH](https://redis.io/commands/rpush)
++ [SCAN](https://redis.io/commands/scan)
+
+#### 事务
+
++ [EXEC](https://redis.io/commands/exec)
++ [MULTI](https://redis.io/commands/multi)
++ [WATCH](https://redis.io/commands/watch)
++ [UNWATCH](https://redis.io/commands/unwatch)
+
+#### 连接管理
+
++ [PING](https://redis.io/commands/ping)
+
+#### 服务管理
+
++ [CONFIG GET](https://redis.io/commands/config-get)
++ [CONFIG SET](https://redis.io/commands/config-set)
++ [DBSIZE](https://redis.io/commands/dbsize)
++ [FLUSHDB](https://redis.io/commands/flushdb)（可选）
++ [INFO](https://redis.io/commands/info)
+
+#### 集群管理
+
++ [CLUSTER INFO](https://redis.io/commands/cluster-info)
+
+#### 脚本（可选）
+
++ [EVALSHA](https://redis.io/commands/evalsha)
++ [SCRIPT LOAD](https://redis.io/commands/script-load)

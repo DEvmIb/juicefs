@@ -1,7 +1,6 @@
 ---
-sidebar_label: Use JuiceFS on WSL
+title: Use JuiceFS on WSL
 ---
-# Use JuiceFS on WSL
 
 WSL is called Windows Subsystem for Linux, which means Windows subsystem for Linux. It allows you to run most GNU/Linux native commands, tools, and programs in a Windows environment without the additional hardware overhead of using a virtual machine or dual system.
 
@@ -86,7 +85,7 @@ JuiceFS is a distributed file system with data and metadata separated, usually u
 
 #### Object Storage
 
-View "[JuiceFS Supported Object Storage](../reference/how_to_setup_object_storage.md)"
+View "[JuiceFS Supported Object Storage](../guide/how_to_set_up_object_storage.md)"
 
 - **Bucket Endpoint**: `https://myjfs.oss-cn-shanghai.aliyuncs.com`
 - **Access Key ID**: `ABCDEFGHIJKLMNopqXYZ`
@@ -94,7 +93,7 @@ View "[JuiceFS Supported Object Storage](../reference/how_to_setup_object_storag
 
 #### Database
 
-View "[JuiceFS Supported Metadata Engines](../reference/how_to_setup_metadata_engine.md)"
+View "[JuiceFS Supported Metadata Engines](../guide/how_to_set_up_metadata_engine.md)"
 
 - **Database URL**: `myjfs-sh-abc.redis.rds.aliyuncs.com:6379`
 - **Database Password**: `mypassword`
@@ -102,12 +101,12 @@ View "[JuiceFS Supported Metadata Engines](../reference/how_to_setup_metadata_en
 Write private information to environment variables:
 
 ```shell
-$ export ACCESS_KEY=ABCDEFGHIJKLMNopqXYZ
-$ export SECRET_KEY=ZYXwvutsrqpoNMLkJiHgfeDCBA
-$ export REDIS_PASSWORD=mypassword
+export ACCESS_KEY=ABCDEFGHIJKLMNopqXYZ
+export SECRET_KEY=ZYXwvutsrqpoNMLkJiHgfeDCBA
+export REDIS_PASSWORD=mypassword
 ```
 
-Create a filesystem named `myjfs`:
+Create a file system named `myjfs`:
 
 ```shell
 juicefs format \
@@ -135,7 +134,7 @@ Mount the file system to `mnt` in the user's home directory:
 sudo juicefs mount -d redis://myjfs-sh-abc.redis.rds.aliyuncs.com:6379/1 $HOME/mnt
 ```
 
-If you need to access the JuiceFS filesystem mounted on a Linux subsystem from a Windows system, find the Linux subsystem in the list on the left side of Explorer, then find and open the mount point path.
+If you need to access the JuiceFS file system mounted on a Linux subsystem from a Windows system, find the Linux subsystem in the list on the left side of Explorer, then find and open the mount point path.
 
 ![](../images/wsl/access-jfs-from-win-en.png)
 
@@ -155,7 +154,7 @@ In the Linux subsystem, WSL mounts each Windows drive to `/mnt`, for example, th
 
 To ensure optimal performance, when using JuiceFS in WSL, both the storage and cache paths should be set in the Linux subsystem. In other words, you should avoid setting the storage or cache on a Windows partition mount point like `/mnt/c`.
 
-Using the `bench` benchmarking tool that comes with JuiceFS, the results show that mounting a filesystem to Windows (e.g. `/mnt/c`) has about 30% lower performance than mounting it inside a Linux subsystem (e.g. `$HOME/mnt`).
+Using the `bench` benchmarking tool that comes with JuiceFS, the results show that mounting a file system to Windows (e.g. `/mnt/c`) has about 30% lower performance than mounting it inside a Linux subsystem (e.g. `$HOME/mnt`).
 
 ## Known Issues
 

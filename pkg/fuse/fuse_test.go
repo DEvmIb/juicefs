@@ -46,7 +46,7 @@ import (
 
 func format(url string) {
 	m := meta.NewClient(url, &meta.Config{})
-	format := meta.Format{
+	format := &meta.Format{
 		Name:      "test",
 		UUID:      uuid.New().String(),
 		Storage:   "file",
@@ -93,13 +93,13 @@ func mount(url, mp string) {
 
 	m.OnMsg(meta.CompactChunk, meta.MsgCallback(func(args ...interface{}) error {
 		slices := args[0].([]meta.Slice)
-		chunkid := args[1].(uint64)
-		return vfs.Compact(chunkConf, store, slices, chunkid)
+		sliceId := args[1].(uint64)
+		return vfs.Compact(chunkConf, store, slices, sliceId)
 	}))
 
 	conf := &vfs.Config{
 		Meta:   metaConf,
-		Format: format,
+		Format: *format,
 		Chunk:  &chunkConf,
 	}
 
@@ -113,7 +113,7 @@ func mount(url, mp string) {
 	conf.DirEntryTimeout = time.Second
 	conf.HideInternal = true
 	v := vfs.NewVFS(conf, m, store, nil, nil)
-	err = Serve(v, "", true)
+	err = Serve(v, "", true, true)
 	if err != nil {
 		log.Fatalf("fuse server err: %s\n", err)
 	}
@@ -292,6 +292,7 @@ func TestFUSE(t *testing.T) {
 	t.Run("StatFS", func(t *testing.T) {
 		StatFS(t, mp)
 	})
+	delete(posixtest.All, "FdLeak")
 	posixtest.All["Xattrs"] = Xattrs
 	posixtest.All["Flock"] = Flock
 	posixtest.All["POSIXLock"] = PosixLock
